@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-06-17
+
+### Changed
+- Project layout: input videos and generated outputs are now sorted into
+  subdirectories — `input_videos/` (`.mov` inputs), `output_videos/`
+  (`*_annotated.mp4`), `output_images/` (`*_position_time.png`), and
+  `output_data/` (`*_position_time.csv`, `front_speed_results.csv`).
+- `process_videos.py`: reads inputs from `input_videos/` and writes each output
+  type to its dedicated directory (created automatically if absent).
+- `process_videos.py`: front direction is now fixed to **downward** instead of
+  auto-detected. Fronts are top-initiated with a soldering iron and propagate
+  down the tube; auto-detection was misclassifying direction and causing every
+  analysis to fail.
+- `process_videos.py`: speed is now fit over the **middle chunk of the tube**
+  (the middle band of total front travel, `MIDDLE_BAND_START_FRACTION` to
+  `MIDDLE_BAND_END_FRACTION`, default 0.25–0.75) rather than a fixed time window.
+  This excludes the initial test-tube jostling and initiation transient as well
+  as the end-of-tube plateau, isolating the steady-state propagation region.
+
+### Removed
+- `process_videos.py`: time-based `FIT_START_FRACTION` / `FIT_END_FRACTION`
+  fit window, replaced by the spatial middle-band selection above.
+
 ## [0.2.0] - 2026-06-17
 
 ### Added

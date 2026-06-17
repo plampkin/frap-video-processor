@@ -1,0 +1,4 @@
+video,status,speed_px_per_s,r2,direction,monomer,initiator,amount,replicate,sample
+AIBN_300_1_S2.mov,FAILED_NO_STABLE_FRONT,0.406,0.2776,up,AIBN,300,1,S2,
+V70_1500_1_S2.mov,FAILED_NO_STABLE_FRONT,0.1746,0.1107,down,V70,1500,1,S2,
+V70_800_1_S2.mov,FAILED_NO_STABLE_FRONT,0.0294,0.0309,up,V70,800,1,S2,
