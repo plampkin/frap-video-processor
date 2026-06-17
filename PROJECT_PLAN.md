@@ -2,7 +2,7 @@
 
 ## 1. Problem Statement
 
-Extract the **front speed** (cm/min or mm/s) from videos of frontal polymerization (FP) experiments in a deterministic, automated manner using Python. Each video shows a reaction front propagating through a monomer-filled test tube. The front appears as a visible luminescent/color boundary moving along the tube axis.
+Extract the **front speed** (mm/s) from videos of frontal polymerization (FP) experiments in a deterministic, automated manner using Python. Each video shows a reaction front propagating through a monomer-filled test tube. The front appears as a visible boundary moving along the tube axis.
 
 **Input:** `.mov` video files named `<monomer>_<initiator>_<amount>_<replicate>_<sample>.mov`
 **Output:** front speed (with units) per video, plus a position-vs-time plot
@@ -109,7 +109,7 @@ Video frames
      │
      ▼
 [7] Output
-       front_speed (cm/min), R², position-time plot, annotated video
+       front_speed (mm/s), R², position-time plot, annotated video
 ```
 
 ### 3.2 Front Position Extraction Detail
@@ -130,7 +130,7 @@ Physical-unit conversion requires knowing the pixel-to-length ratio. Two options
 1. **Known tube length**: measure the tube in pixels from the video; divide by known physical length (e.g., 15 cm)
 2. **Reference marker**: place a ruler or marker of known length in the frame
 
-Without calibration, the code can report speed in **pixels/second**; calibration converts this to cm/min.
+Without calibration, the code will report speed in **pixels/second**. When a calibration value is supplied (`CALIBRATION_MM_PER_PX`), this is converted to **mm/s**.
 
 ---
 
@@ -165,6 +165,18 @@ Without calibration, the code can report speed in **pixels/second**; calibration
 - Apply morphological closing to clean binary mask
 - Visualize binary mask overlay on original frame to verify quality
 
+**Noise mitigation (bubble formation and artifacts):**
+
+Bubbles and other transient artifacts can create spurious bright/dark regions that corrupt front position estimates. The plan to isolate the true front from noise:
+
+1. **Minimum width filter:** a valid front row must span ≥ `MIN_FRONT_WIDTH_FRACTION` of the ROI width (default 30%). Isolated bubble pixels spanning only a few columns are rejected.
+2. **Morphological opening before closing:** `binary_opening` (erosion then dilation) removes small isolated blobs (bubbles) before `binary_closing` fills gaps along the real front.
+3. **Temporal outlier rejection:** after extracting per-frame front positions, flag frames where the front position jumps more than a threshold (e.g., > 2× median frame-to-frame displacement) as outlier frames caused by noise; exclude them from the position-time series.
+4. **Rolling median smoothing:** apply a rolling median over `TEMPORAL_SMOOTH_FRAMES` frames to suppress remaining high-frequency noise while preserving the monotonic front trajectory.
+5. **Column-wise aggregation:** instead of using a single front-y per frame, compute the front y position column-by-column and take the **median** across columns — bubble pixels in isolated columns are down-weighted.
+
+Only the smoothed, noise-filtered front position time series is used for speed extraction.
+
 **Deliverable:** threshold function that reliably segments the front in all 4 videos
 
 ### Phase 3 — Front Position Extraction (2–3 hours)
@@ -183,7 +195,7 @@ Without calibration, the code can report speed in **pixels/second**; calibration
 **Tasks:**
 - Fit linear regression to the linear portion of `y vs t` (`scipy.stats.linregress`)
 - Apply pixel-to-physical calibration (user-supplied or auto-detected)
-- Report: slope (px/s), speed (cm/min), R², 95% confidence interval
+- Report: slope (px/s), speed (mm/s if calibrated, else px/s), R², 95% confidence interval
 - Produce publication-quality position-time plot with regression line
 
 **Deliverable:** speed output per video, `front_speed_results.csv`
@@ -278,6 +290,27 @@ uv pip install opencv-python scikit-image numpy scipy matplotlib pandas
 | Different lighting across videos | Use Otsu's adaptive threshold per-video |
 | Front direction varies by video | Auto-detect direction from first vs last frame |
 | LFS-stored videos not fully available | Ensure `git lfs pull` is run before processing |
+| Reaction failure (no stable front or front stops early) | See failure detection plan below |
+
+### 9.1 Reaction Failure Detection
+
+A reaction can fail in three distinct ways, each requiring a detection strategy:
+
+**Case 1 — No stable front ever forms**
+- Symptom: the binary mask has no consistently positioned leading edge; front-y positions are scattered across the entire ROI with no monotonic trend.
+- Detection: after extracting the position-time series, compute the R² of the linear fit. If R² < 0.80 (threshold TBD based on real data), flag the video as `FAILED_NO_STABLE_FRONT`.
+- Secondary check: if the standard deviation of frame-to-frame displacements exceeds a threshold (e.g., > 5× the median displacement), treat as noise-dominated / no front.
+
+**Case 2 — Front stops partway through (stalled reaction)**
+- Symptom: front-y is monotonically increasing for a portion of the video, then plateaus or reverses.
+- Detection: split the position-time series into two halves. Compute slope in each half. If the second-half slope is < 20% of the first-half slope, flag as `FAILED_FRONT_STALLED` and report the stall time and position.
+- Alternative: fit a piecewise linear model (two segments with a breakpoint); if the second segment slope is near-zero, declare a stall.
+
+**Case 3 — Front does not reach the bottom of the tube**
+- Symptom: the front-y never reaches the expected tube-end pixel position before the video ends.
+- Detection: compare the final front-y position to the ROI height. If the front traveled < 80% of the tube length by the last frame, flag as `FAILED_FRONT_DID_NOT_COMPLETE` and report the fraction of tube traversed.
+
+**Reporting:** all three failure modes are written as a `status` column in `front_speed_results.csv` (`OK`, `FAILED_NO_STABLE_FRONT`, `FAILED_FRONT_STALLED`, `FAILED_FRONT_DID_NOT_COMPLETE`). A failed video still writes partial results (partial speed, R², fraction completed) for diagnostic use.
 
 ---
 
