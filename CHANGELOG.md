@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] - 2026-06-17
+
+### Added
+- `process_videos.py`: Full pipeline for automated front speed extraction from `.mov` files.
+  - Phase 1: Video metadata inspection (dimensions, FPS, frame count)
+  - Phase 2: Grayscale conversion, Gaussian blur, global Otsu thresholding with morphological open+close
+  - Phase 3: Vectorized column-wise front position extraction with minimum-width filter; temporal outlier rejection (>2× median displacement) and rolling-median smoothing
+  - Phase 4: Linear regression (scipy.stats.linregress) over configurable fit window (FIT_START/END_FRACTION); outputs speed in px/s (or mm/s when CALIBRATION_MM_PER_PX is set) and R²
+  - Phase 5: Annotated output video with front-position overlay line and speed label
+  - Phase 6: Batch processing of all `.mov` files; parses filename metadata fields (monomer, initiator, amount, replicate, sample)
+  - Failure detection: FAILED_NO_STABLE_FRONT (R²<0.80), FAILED_FRONT_STALLED (second-half slope <20% of first-half), FAILED_FRONT_DID_NOT_COMPLETE (front traveled <80% of ROI height)
+  - Outputs per video: `*_position_time.csv`, `*_position_time.png`; aggregated `front_speed_results.csv`
+
 ## [0.1.1] - 2026-06-17
 
 ### Changed
