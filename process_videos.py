@@ -19,22 +19,24 @@ os.makedirs(OUTPUT_DATA_DIR, exist_ok=True)
 
 # Parameters
 BLUR_KERNEL = 5
-THRESHOLD_METHOD = 'otsu'
-MIN_FRONT_WIDTH_FRACTION = 0.3
 TEMPORAL_SMOOTH_FRAMES = 5
 CALIBRATION_MM_PER_PX = None  # Set to e.g. 0.1 for 0.1 mm/px; None reports px/s
 ROI = None  # (x, y, w, h) crop to tube region, or None for full frame
 # Fronts are initiated at the top with a soldering iron and travel downward.
 FRONT_DIRECTION = 'down'
-# The front is only searched for within the middle 50% of the frame height:
-# the top 25% (initial test-tube jostling + soldering-iron initiation) and the
-# bottom 25% (end-of-tube plateau) are excluded. The front is not moving at the
+# The front is only searched for within the middle 33% of the frame height:
+# the top third (initial test-tube jostling + soldering-iron initiation) and the
+# bottom third (end-of-tube plateau) are excluded. The front is not moving at the
 # start of the video and may enter this band at any time.
-MONITOR_BAND_TOP_FRACTION = 0.25
-MONITOR_BAND_BOTTOM_FRACTION = 0.75
+MONITOR_BAND_TOP_FRACTION = 1.0 / 3.0
+MONITOR_BAND_BOTTOM_FRACTION = 2.0 / 3.0
 # Fraction of the band height treated as edge-pinning (front not yet entered, or
 # fully reacted plateau) and excluded from the speed fit.
 EDGE_MARGIN_FRACTION = 0.02
+# Kymograph smoothing kernel (odd) and the relative edge-strength gate below which
+# a time column is treated as "front not present" (NaN).
+KYMO_SMOOTH = 5
+KYMO_EDGE_GATE = 0.30
 
 results = []
 
@@ -67,56 +69,43 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
     frames_gray = np.array(frames_gray)
     n_frames, roi_h, roi_w = frames_gray.shape
 
-    # Restrict all analysis to the middle 50% band of the frame height.
+    # Restrict all analysis to the middle 33% band of the frame height.
     band_top = int(roi_h * MONITOR_BAND_TOP_FRACTION)
     band_bottom = int(roi_h * MONITOR_BAND_BOTTOM_FRACTION)
     band_frames = frames_gray[:, band_top:band_bottom, :]
     band_h = band_frames.shape[1]
 
-    # Global Otsu threshold sampled across frames (within the band)
-    sample_idx = np.linspace(0, n_frames - 1, min(30, n_frames), dtype=int)
-    global_thresh = int(np.median([
-        cv2.threshold(band_frames[i], 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[0]
-        for i in sample_idx
-    ]))
-
-    # Which binary class grew from first to last frame → that class is "reacted"
-    first_bright_frac = np.mean(band_frames[0] > global_thresh)
-    last_bright_frac = np.mean(band_frames[-1] > global_thresh)
-    reacted_value = 1 if last_bright_frac > first_bright_frac else 0
-
     # Fronts are top-initiated and travel downward; direction is fixed, not auto-detected.
     front_direction = FRONT_DIRECTION
-    print(f"  Reacted class: {'bright' if reacted_value == 1 else 'dark'}, direction: {front_direction}")
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    min_width_px = max(1, int(roi_w * MIN_FRONT_WIDTH_FRACTION))
-    front_positions = []
+    # --- Kymographic front tracking ---
+    # Collapse each frame to a 1-D vertical intensity profile (median across the
+    # tube width) inside the monitoring band, then stack the per-frame profiles
+    # column-by-column into a space-time kymograph: rows = vertical position
+    # within the band, columns = frame index (time). The reaction front is the
+    # moving boundary between reacted and unreacted material, which appears as a
+    # single tilted edge sweeping across the kymograph; its slope is the speed.
+    kymo = np.median(band_frames, axis=2).T.astype(np.float32)  # (band_h, n_frames)
+    kymo = cv2.GaussianBlur(kymo, (KYMO_SMOOTH, KYMO_SMOOTH), 0)
 
-    for frame_gray in band_frames:
-        binary = (frame_gray > global_thresh).astype(np.uint8)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    # Vertical intensity gradient: |dI/dy| peaks at the reacted/unreacted edge in
+    # each time column. Tracking the gradient edge is robust to the absolute
+    # brightness of either phase (no per-frame thresholding / morphology needed).
+    grad_mag = np.abs(cv2.Sobel(kymo, cv2.CV_32F, 0, 1, ksize=3))
 
-        reacted_mask = (binary == reacted_value)
-        col_has_reacted = np.any(reacted_mask, axis=0)
+    # Per-column (per-frame) front = row of strongest edge, gated so columns the
+    # front has not yet entered (weak edge) stay undetected (NaN). The front can
+    # therefore appear at any time rather than being assumed present from frame 0.
+    col_max = grad_mag.max(axis=0)
+    gate = KYMO_EDGE_GATE * float(np.nanmax(col_max))
+    front_band = np.argmax(grad_mag, axis=0).astype(float)
+    front_band[col_max < gate] = np.nan
 
-        if np.sum(col_has_reacted) < min_width_px:
-            front_positions.append(np.nan)
-            continue
+    # Convert band-relative rows to absolute frame-row coordinates.
+    front_positions = band_top + front_band
 
-        if front_direction == 'down':
-            # Leading edge = bottommost reacted row per column (within band)
-            flipped = reacted_mask[::-1, :]
-            col_fronts = band_h - 1 - np.argmax(flipped, axis=0)
-        else:
-            # Leading edge = topmost reacted row per column (within band)
-            col_fronts = np.argmax(reacted_mask, axis=0)
-
-        # Store as absolute frame-row coordinate
-        front_positions.append(band_top + float(np.median(col_fronts[col_has_reacted])))
-
-    front_positions = np.array(front_positions, dtype=float)
+    print(f"  Kymograph {kymo.shape[0]}x{kymo.shape[1]}, direction: {front_direction}, "
+          f"front detected in {int(np.sum(~np.isnan(front_positions)))}/{n_frames} frames")
 
     # Temporal outlier rejection: flag jumps > 2× median frame-to-frame displacement
     diffs = np.abs(np.diff(front_positions))
@@ -197,6 +186,25 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
     fig.tight_layout()
     fig.savefig(os.path.join(OUTPUT_IMAGE_DIR, f'{stem}_position_time.png'), dpi=150)
     plt.close(fig)
+
+    # Kymograph diagnostic: space-time image (x=time, y=absolute frame row) with
+    # the monitoring band, the tracked front, and the fitted speed line overlaid.
+    figk, axk = plt.subplots(figsize=(8, 5))
+    axk.imshow(kymo, cmap='gray', aspect='auto',
+               extent=[times[0], times[-1], band_bottom, band_top])
+    axk.plot(times, smooth, '.', color='cyan', ms=2, label='Tracked front')
+    if not np.isnan(slope):
+        axk.plot(fit_t[valid], slope * fit_t[valid] + intercept, 'r-',
+                 label=f'Fit: {speed:.2f} {speed_unit}, R²={r2:.3f}')
+    axk.axhline(band_top, color='yellow', lw=1)
+    axk.axhline(band_bottom, color='yellow', lw=1)
+    axk.set_xlabel('Time (s)')
+    axk.set_ylabel('Front position (px)')
+    axk.set_title(f'{stem} kymograph\n{speed:.2f} {speed_unit}  [{status}]')
+    axk.legend()
+    figk.tight_layout()
+    figk.savefig(os.path.join(OUTPUT_IMAGE_DIR, f'{stem}_kymograph.png'), dpi=150)
+    plt.close(figk)
 
     # Annotated video
     cap2 = cv2.VideoCapture(video_path)

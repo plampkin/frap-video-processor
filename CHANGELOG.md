@@ -2,6 +2,39 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-06-17
+
+### Changed
+- `process_videos.py`: front detection now uses a **kymographic method**. Each
+  frame is collapsed to a 1-D vertical intensity profile (median across the tube
+  width) inside the monitoring band, and the per-frame profiles are stacked into
+  a space-time kymograph (rows = position, columns = time). The reaction front is
+  tracked as the strongest vertical-intensity-gradient (`|dI/dy|`) edge in each
+  time column, replacing the previous per-frame Otsu thresholding + morphology +
+  reacted-class detection. This is robust to the absolute brightness of either
+  phase and removes the binary-class failure mode that produced
+  `FAILED_NO_STABLE_FRONT` on every video.
+- `process_videos.py`: the monitoring band is narrowed from the middle 50% to the
+  **middle 33%** of the frame height (`MONITOR_BAND_TOP_FRACTION` = 1/3,
+  `MONITOR_BAND_BOTTOM_FRACTION` = 2/3), excluding the top-third initiation/jostling
+  and the bottom-third end-of-tube plateau more aggressively.
+- `process_videos.py`: columns whose edge strength falls below `KYMO_EDGE_GATE`
+  (relative to the peak) are left undetected (`NaN`), so the front is picked up
+  whenever it enters the band rather than being assumed present from frame 0.
+
+### Added
+- `process_videos.py`: new parameters `KYMO_SMOOTH` (kymograph smoothing kernel)
+  and `KYMO_EDGE_GATE` (relative edge-strength gate).
+- `process_videos.py`: a per-video kymograph diagnostic image
+  `output_images/<stem>_kymograph.png` showing the space-time kymograph with the
+  monitoring band, the tracked front, and the fitted speed line overlaid.
+
+### Removed
+- `process_videos.py`: per-frame Otsu threshold sampling, morphological
+  open/close, reacted-class (bright/dark) detection, and the
+  `MIN_FRONT_WIDTH_FRACTION` width filter — superseded by the kymograph gradient
+  tracker.
+
 ## [0.4.0] - 2026-06-17
 
 ### Changed
