@@ -8,6 +8,15 @@ import pandas as pd
 import glob
 import os
 
+# Directories
+INPUT_DIR = 'input_videos'
+OUTPUT_VIDEO_DIR = 'output_videos'
+OUTPUT_IMAGE_DIR = 'output_images'
+OUTPUT_DATA_DIR = 'output_data'
+os.makedirs(OUTPUT_VIDEO_DIR, exist_ok=True)
+os.makedirs(OUTPUT_IMAGE_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DATA_DIR, exist_ok=True)
+
 # Parameters
 BLUR_KERNEL = 5
 THRESHOLD_METHOD = 'otsu'
@@ -15,14 +24,19 @@ MIN_FRONT_WIDTH_FRACTION = 0.3
 TEMPORAL_SMOOTH_FRAMES = 5
 CALIBRATION_MM_PER_PX = None  # Set to e.g. 0.1 for 0.1 mm/px; None reports px/s
 ROI = None  # (x, y, w, h) crop to tube region, or None for full frame
-FIT_START_FRACTION = 0.1
-FIT_END_FRACTION = 0.9
+# Fronts are initiated at the top with a soldering iron and travel downward.
+FRONT_DIRECTION = 'down'
+# Speed is measured while the front passes through the middle chunk of the tube,
+# expressed as fractions of the total front travel (0 = top/start, 1 = bottom/end).
+# This excludes the initial jostling/initiation transient and the end-of-tube plateau.
+MIDDLE_BAND_START_FRACTION = 0.25
+MIDDLE_BAND_END_FRACTION = 0.75
 
 results = []
 
-for video_path in sorted(glob.glob('*.mov')):
+for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
     print(f"Processing {video_path}")
-    stem = os.path.splitext(video_path)[0]
+    stem = os.path.splitext(os.path.basename(video_path))[0]
 
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -61,13 +75,8 @@ for video_path in sorted(glob.glob('*.mov')):
     last_bright_frac = np.mean(frames_gray[-1] > global_thresh)
     reacted_value = 1 if last_bright_frac > first_bright_frac else 0
 
-    # Front direction: where is the reacted zone concentrated in last frame?
-    last_binary = (frames_gray[-1] > global_thresh).astype(np.uint8)
-    reacted_last = (last_binary == reacted_value)
-    top_frac = np.mean(reacted_last[:roi_h // 4])
-    bot_frac = np.mean(reacted_last[3 * roi_h // 4:])
-    # If reacted zone is at top in last frame, front moved downward
-    front_direction = 'down' if top_frac > bot_frac else 'up'
+    # Fronts are top-initiated and travel downward; direction is fixed, not auto-detected.
+    front_direction = FRONT_DIRECTION
     print(f"  Reacted class: {'bright' if reacted_value == 1 else 'dark'}, direction: {front_direction}")
 
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
@@ -113,11 +122,20 @@ for video_path in sorted(glob.glob('*.mov')):
 
     times = np.arange(n_frames) / fps
 
-    # Fit range
-    start_i = int(n_frames * FIT_START_FRACTION)
-    end_i = int(n_frames * FIT_END_FRACTION)
-    fit_t = times[start_i:end_i]
-    fit_p = smooth[start_i:end_i]
+    # Fit only while the front passes through the middle chunk of the tube.
+    # The front travels downward, so its position grows from a small value (top,
+    # at initiation) to a large value (bottom, at completion). Selecting the middle
+    # band of that travel excludes the initial jostling/initiation transient and the
+    # end-of-tube plateau, leaving the steady-state propagation region.
+    y_min = np.nanmin(smooth)
+    y_max = np.nanmax(smooth)
+    travel = y_max - y_min
+    band_lo = y_min + travel * MIDDLE_BAND_START_FRACTION
+    band_hi = y_min + travel * MIDDLE_BAND_END_FRACTION
+    in_band = (~np.isnan(smooth)) & (smooth >= band_lo) & (smooth <= band_hi)
+
+    fit_t = times[in_band]
+    fit_p = smooth[in_band]
     valid = ~np.isnan(fit_p)
 
     slope = intercept = speed_px_s = r2 = np.nan
@@ -158,7 +176,7 @@ for video_path in sorted(glob.glob('*.mov')):
         'time_s': times,
         'front_y_px_raw': front_positions,
         'front_y_px_smooth': smooth,
-    }).to_csv(f'{stem}_position_time.csv', index=False)
+    }).to_csv(os.path.join(OUTPUT_DATA_DIR, f'{stem}_position_time.csv'), index=False)
 
     # Position-vs-time plot
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -171,13 +189,13 @@ for video_path in sorted(glob.glob('*.mov')):
     ax.set_title(f'{stem}\n{speed:.2f} {speed_unit}  [{status}]')
     ax.legend()
     fig.tight_layout()
-    fig.savefig(f'{stem}_position_time.png', dpi=150)
+    fig.savefig(os.path.join(OUTPUT_IMAGE_DIR, f'{stem}_position_time.png'), dpi=150)
     plt.close(fig)
 
     # Annotated video
     cap2 = cv2.VideoCapture(video_path)
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(f'{stem}_annotated.mp4', fourcc, fps, (frame_w, frame_h_orig))
+    out = cv2.VideoWriter(os.path.join(OUTPUT_VIDEO_DIR, f'{stem}_annotated.mp4'), fourcc, fps, (frame_w, frame_h_orig))
     roi_x_offset = ROI[0] if ROI is not None else 0
     roi_y_offset = ROI[1] if ROI is not None else 0
     roi_width = ROI[2] if ROI is not None else frame_w
@@ -209,6 +227,7 @@ for video_path in sorted(glob.glob('*.mov')):
         **meta,
     })
 
-pd.DataFrame(results).to_csv('front_speed_results.csv', index=False)
-print('\nResults saved to front_speed_results.csv')
+results_path = os.path.join(OUTPUT_DATA_DIR, 'front_speed_results.csv')
+pd.DataFrame(results).to_csv(results_path, index=False)
+print(f'\nResults saved to {results_path}')
 print(pd.DataFrame(results).to_string())
