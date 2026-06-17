@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-06-17
+
+### Changed
+- `process_videos.py`: front detection is now restricted to the **middle 50% of
+  the frame** (`MONITOR_BAND_TOP_FRACTION` to `MONITOR_BAND_BOTTOM_FRACTION`,
+  default 0.25–0.75). Otsu thresholding, reacted-class detection, and front
+  tracking all operate only inside this band, removing the top-of-tube jostling /
+  soldering-iron initiation and the bottom-of-tube artifacts that were preventing
+  the front from being spotted.
+- `process_videos.py`: the front is tracked every frame and may enter the band at
+  **any time** — before it arrives there is no reacted region (`NaN`), so the
+  speed fit starts whenever the front actually appears rather than assuming motion
+  from the start of the video.
+- `process_videos.py`: speed is fit over the band transit only, excluding the
+  pre-entry frames and the fully-reacted bottom plateau via `EDGE_MARGIN_FRACTION`.
+- `process_videos.py`: annotated video now draws the monitoring-band boundaries.
+
+### Removed
+- `process_videos.py`: `MIDDLE_BAND_START_FRACTION` / `MIDDLE_BAND_END_FRACTION`
+  (band of *total detected travel*), replaced by the fixed middle-50%-of-frame
+  monitoring band above.
+
 ## [0.3.0] - 2026-06-17
 
 ### Changed
