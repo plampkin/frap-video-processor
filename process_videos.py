@@ -26,11 +26,15 @@ CALIBRATION_MM_PER_PX = None  # Set to e.g. 0.1 for 0.1 mm/px; None reports px/s
 ROI = None  # (x, y, w, h) crop to tube region, or None for full frame
 # Fronts are initiated at the top with a soldering iron and travel downward.
 FRONT_DIRECTION = 'down'
-# Speed is measured while the front passes through the middle chunk of the tube,
-# expressed as fractions of the total front travel (0 = top/start, 1 = bottom/end).
-# This excludes the initial jostling/initiation transient and the end-of-tube plateau.
-MIDDLE_BAND_START_FRACTION = 0.25
-MIDDLE_BAND_END_FRACTION = 0.75
+# The front is only searched for within the middle 50% of the frame height:
+# the top 25% (initial test-tube jostling + soldering-iron initiation) and the
+# bottom 25% (end-of-tube plateau) are excluded. The front is not moving at the
+# start of the video and may enter this band at any time.
+MONITOR_BAND_TOP_FRACTION = 0.25
+MONITOR_BAND_BOTTOM_FRACTION = 0.75
+# Fraction of the band height treated as edge-pinning (front not yet entered, or
+# fully reacted plateau) and excluded from the speed fit.
+EDGE_MARGIN_FRACTION = 0.02
 
 results = []
 
@@ -63,16 +67,22 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
     frames_gray = np.array(frames_gray)
     n_frames, roi_h, roi_w = frames_gray.shape
 
-    # Global Otsu threshold sampled across frames
+    # Restrict all analysis to the middle 50% band of the frame height.
+    band_top = int(roi_h * MONITOR_BAND_TOP_FRACTION)
+    band_bottom = int(roi_h * MONITOR_BAND_BOTTOM_FRACTION)
+    band_frames = frames_gray[:, band_top:band_bottom, :]
+    band_h = band_frames.shape[1]
+
+    # Global Otsu threshold sampled across frames (within the band)
     sample_idx = np.linspace(0, n_frames - 1, min(30, n_frames), dtype=int)
     global_thresh = int(np.median([
-        cv2.threshold(frames_gray[i], 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[0]
+        cv2.threshold(band_frames[i], 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[0]
         for i in sample_idx
     ]))
 
     # Which binary class grew from first to last frame → that class is "reacted"
-    first_bright_frac = np.mean(frames_gray[0] > global_thresh)
-    last_bright_frac = np.mean(frames_gray[-1] > global_thresh)
+    first_bright_frac = np.mean(band_frames[0] > global_thresh)
+    last_bright_frac = np.mean(band_frames[-1] > global_thresh)
     reacted_value = 1 if last_bright_frac > first_bright_frac else 0
 
     # Fronts are top-initiated and travel downward; direction is fixed, not auto-detected.
@@ -83,7 +93,7 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
     min_width_px = max(1, int(roi_w * MIN_FRONT_WIDTH_FRACTION))
     front_positions = []
 
-    for frame_gray in frames_gray:
+    for frame_gray in band_frames:
         binary = (frame_gray > global_thresh).astype(np.uint8)
         binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
@@ -96,14 +106,15 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
             continue
 
         if front_direction == 'down':
-            # Leading edge = bottommost reacted row per column
+            # Leading edge = bottommost reacted row per column (within band)
             flipped = reacted_mask[::-1, :]
-            col_fronts = roi_h - 1 - np.argmax(flipped, axis=0)
+            col_fronts = band_h - 1 - np.argmax(flipped, axis=0)
         else:
-            # Leading edge = topmost reacted row per column
+            # Leading edge = topmost reacted row per column (within band)
             col_fronts = np.argmax(reacted_mask, axis=0)
 
-        front_positions.append(float(np.median(col_fronts[col_has_reacted])))
+        # Store as absolute frame-row coordinate
+        front_positions.append(band_top + float(np.median(col_fronts[col_has_reacted])))
 
     front_positions = np.array(front_positions, dtype=float)
 
@@ -122,17 +133,12 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
 
     times = np.arange(n_frames) / fps
 
-    # Fit only while the front passes through the middle chunk of the tube.
-    # The front travels downward, so its position grows from a small value (top,
-    # at initiation) to a large value (bottom, at completion). Selecting the middle
-    # band of that travel excludes the initial jostling/initiation transient and the
-    # end-of-tube plateau, leaving the steady-state propagation region.
-    y_min = np.nanmin(smooth)
-    y_max = np.nanmax(smooth)
-    travel = y_max - y_min
-    band_lo = y_min + travel * MIDDLE_BAND_START_FRACTION
-    band_hi = y_min + travel * MIDDLE_BAND_END_FRACTION
-    in_band = (~np.isnan(smooth)) & (smooth >= band_lo) & (smooth <= band_hi)
+    # Fit only while the front is in transit through the monitoring band. Before
+    # the front enters there is no reacted region (NaN), and once the band is fully
+    # reacted the leading edge pins to the bottom of the band (plateau). A small edge
+    # margin drops both, leaving whenever-it-occurs steady-state propagation.
+    margin = band_h * EDGE_MARGIN_FRACTION
+    in_band = (~np.isnan(smooth)) & (smooth > band_top + margin) & (smooth < band_bottom - margin)
 
     fit_t = times[in_band]
     fit_p = smooth[in_band]
@@ -158,7 +164,7 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
                     status = 'FAILED_FRONT_STALLED'
                 else:
                     front_range = np.nanmax(smooth) - np.nanmin(smooth)
-                    status = 'FAILED_FRONT_DID_NOT_COMPLETE' if front_range / roi_h < 0.8 else 'OK'
+                    status = 'FAILED_FRONT_DID_NOT_COMPLETE' if front_range / band_h < 0.8 else 'OK'
             else:
                 status = 'OK'
 
@@ -200,10 +206,16 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
     roi_y_offset = ROI[1] if ROI is not None else 0
     roi_width = ROI[2] if ROI is not None else frame_w
 
+    band_top_abs = band_top + roi_y_offset
+    band_bottom_abs = band_bottom + roi_y_offset
+
     for i, front_y in enumerate(smooth):
         ret, frame = cap2.read()
         if not ret:
             break
+        # Monitoring band boundaries (middle 50% of the frame)
+        cv2.line(frame, (roi_x_offset, band_top_abs), (roi_x_offset + roi_width, band_top_abs), (255, 255, 0), 1)
+        cv2.line(frame, (roi_x_offset, band_bottom_abs), (roi_x_offset + roi_width, band_bottom_abs), (255, 255, 0), 1)
         if not np.isnan(front_y):
             fy_abs = int(front_y) + roi_y_offset
             cv2.line(frame, (roi_x_offset, fy_abs), (roi_x_offset + roi_width, fy_abs), (0, 0, 255), 2)
