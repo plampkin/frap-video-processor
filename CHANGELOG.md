@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.12.0] - 2026-06-18
+
+### Changed
+- `process_videos.py`: **reverted the kymograph response function to the polarity-agnostic
+  second derivative `|d²I/dy²|`** (restored `LINE_KSIZE`), undoing the 0.11.0 signed
+  first-derivative positive-clip (`clip(dI/dy, 0)`). The 0.11.0 response committed to a
+  single contrast polarity (it only fired where reacted was dark/above, losing the front
+  on opposite-contrast samples) and reverted to a first-derivative intensity gradient that
+  was abandoned in 0.6.0 for latching onto lighting, tube walls, and bubbles. The response
+  is again a symmetric ridge on the front (the 0.10.0 build); the per-row temporal-median
+  subtraction is kept.
+- `process_videos.py`: **the per-column trace is now the leading edge, not the
+  intensity-weighted centroid.** The front direction is fixed downward, so within the
+  window around the Radon seed line each column takes the **leading edge** — the first
+  response crossing of the edge threshold on the unreacted (advancing) side, i.e. the
+  deepest crossing in the window. The bubble-banded interior sits *behind* the front
+  (above it) and is excluded, fixing the `V70_800` case where the banding pulled the
+  centroid shallow off the true edge. Renamed `CENTROID_HALF_FRAC` → `EDGE_HALF_FRAC`;
+  removed `CENTROID_GATE`.
+- `process_videos.py`: kept the other 0.11.0 changes unchanged — `START_FRACTION = 1/3`,
+  the edge-presence threshold computed on the retained (post-cut) region only, and the
+  time-coverage + fill/continuity gates replacing R².
+
 ## [0.11.0] - 2026-06-18
 
 ### Changed

@@ -28,20 +28,21 @@ BAND_TOP_FRACTION = 0.25
 BAND_BOTTOM_FRACTION = 0.75
 BAND_LEFT_FRACTION = 0.25
 BAND_RIGHT_FRACTION = 0.75
-# The front is the leading unreacted->reacted EDGE: unreacted (light) ahead/below,
-# reacted (dark) behind/above. On a top->bottom column scan it is a light-below /
-# dark-above step, so the signed vertical FIRST derivative (positive part) fires on
-# that transition while the uniform dark interior behind the front and the horizontal
-# bubble banding contribute ~zero (and static bands are also killed by the temporal-
-# median subtraction). On the space-time kymograph the moving edge is one clear
-# diagonal whose slope is the front speed (rows per frame). The front speed can vary
+# The front is a thin horizontal feature (the unreacted->reacted boundary) with no
+# reliable brightness polarity, so the kymograph response is the polarity-agnostic
+# vertical SECOND derivative |d^2 I/dy^2| (LINE_KSIZE): it fires as a symmetric ridge
+# on the front whether it reads slightly dark or bright, while the uniform interior
+# behind the front gives ~zero. Averaging across the band width keeps the full-width
+# line and dilutes local bubbles/glints; subtracting each row's temporal median then
+# cancels the static horizontal banding. On the space-time kymograph the moving front
+# is one clear diagonal whose slope is the front speed (rows per frame). The speed can vary
 # wildly between runs, so we do NOT assume a narrow speed range. Instead we find the
 # diagonal with a Radon-style line-integral search over a WIDE range of downward
 # slopes: summing the kymograph response along each candidate line raises the SNR of a
 # faint front, and near-horizontal lines (bubble bands / residual static features) are
 # excluded by the slope range so they can never win. The maximizing line seeds a
-# per-column centroid trace, which is then fit robustly (Theil-Sen -> OLS).
-EDGE_KSIZE = 3                  # vertical 1st-derivative kernel (unreacted->reacted edge)
+# per-column leading-edge trace, which is then fit robustly (Theil-Sen -> OLS).
+LINE_KSIZE = 3                  # vertical 2nd-derivative line kernel (polarity-agnostic)
 KYMO_SMOOTH = 5                 # Gaussian smoothing of the kymograph (odd)
 START_FRACTION = 1.0 / 3.0      # ignore the first ~1/3 (jostling + initiation transient)
 EDGE_PCTL = 80                  # edge-presence threshold percentile (retained region only)
@@ -49,8 +50,7 @@ N_SLOPES = 240                  # number of candidate downward slopes in the Rad
 SLOPE_MIN_TRAVEL_FRAC = 0.10    # slowest front: covers >= this frac of band over the whole video
 MIN_TRANSIT_FRAC = 0.05         # fastest front: can't cross the band in < this frac of frames
 MIN_SUPPORT_FRAC = 0.15         # a candidate line must span >= this frac of retained frames
-CENTROID_HALF_FRAC = 0.06       # half-window (frac of band height) for the per-column centroid
-CENTROID_GATE = 0.20            # keep columns whose centroid support >= this frac of the peak
+EDGE_HALF_FRAC = 0.06           # half-window (frac of band height) for the per-column edge search
 INLIER_TOL_FRAC = 0.05          # fit inlier tolerance, as a fraction of band height
 MIN_COVERAGE_FRAC = 0.50        # inliers must span >= this frac of the post-cut time axis
 MIN_FILL_FRAC = 0.50            # >= this frac of spanned columns must carry a front pixel
@@ -92,18 +92,17 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
     band_h = band_frames.shape[1]
 
     # --- Build the space-time kymograph over the band ---
-    # The front is the leading unreacted->reacted edge: reacted (dark) above, unreacted
-    # (light) below. Scanning a column top->bottom the brightness STEPS UP at the front,
-    # so the vertical first derivative dI/dy is positive there (cv2.Sobel order-1 reads
-    # positive when the pixels below are brighter). Keeping only the positive part fires
-    # on that light-below/dark-above transition while the uniform dark interior behind
-    # the front and the horizontal bubble banding give ~zero response. Averaging across
-    # the band width (the front spans the whole tube) keeps the full-width edge and
-    # dilutes local bubbles/glints. Stacking the per-frame profiles gives L[y, t].
+    # The front is a thin horizontal line (the unreacted->reacted boundary) with no
+    # reliable brightness polarity, so each band frame is run through a polarity-agnostic
+    # vertical second-derivative line detector |d^2 I/dy^2| (LINE_KSIZE): it responds as a
+    # symmetric ridge on the front whether it reads slightly dark or bright, while the
+    # uniform interior behind the front gives ~zero. Averaging across the band width (the
+    # front spans the whole tube) keeps the full-width line and dilutes local
+    # bubbles/glints. Stacking the per-frame profiles gives L[y, t].
     L = np.empty((band_h, n_frames), dtype=np.float32)
     for t in range(n_frames):
-        dy = cv2.Sobel(band_frames[t].astype(np.float32), cv2.CV_32F, 0, 1, ksize=EDGE_KSIZE)
-        L[:, t] = np.clip(dy, 0, None).mean(axis=1)
+        d2y = cv2.Sobel(band_frames[t].astype(np.float32), cv2.CV_32F, 0, 2, ksize=LINE_KSIZE)
+        L[:, t] = np.abs(d2y).mean(axis=1)
     L = cv2.GaussianBlur(L, (KYMO_SMOOTH, KYMO_SMOOTH), 0)
     # Remove static horizontal features (tube bottom, meniscus, fixed markings): they
     # are constant in time, so subtracting each row's temporal median cancels them
@@ -128,7 +127,7 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
     # the line (normalized by its in-frame length), over the retained columns only.
     # Summing the whole line lifts a faint front out of the noise; near-horizontal lines
     # are excluded by the slope range, so bubble bands / residual static features can
-    # never accumulate. The maximizing (m, b) seeds the per-column centroid trace below.
+    # never accumulate. The maximizing (m, b) seeds the per-column leading-edge trace below.
     slope = intercept = speed_px_s = np.nan
     coverage_frac = fill_frac = np.nan
     n_inliers = 0
@@ -140,7 +139,7 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
     m_max = band_h / max(1.0, MIN_TRANSIT_FRAC * n_frames)     # fastest plausible front
     slopes = np.linspace(m_min, m_max, N_SLOPES)
     min_support = max(10, int(MIN_SUPPORT_FRAC * n_ret))
-    half = max(3, int(CENTROID_HALF_FRAC * band_h))
+    half = max(3, int(EDGE_HALF_FRAC * band_h))
 
     best_score = -1.0
     seed_slope = seed_inter = np.nan
@@ -158,12 +157,17 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
             best_score = float(score[bi])
             seed_slope, seed_inter = float(m), float(bi)
 
-    # --- Per-column intensity-weighted centroid around the seed line ---
-    # One sub-pixel front position per frame (not a pixel cloud) removes the shallow-
-    # slope/intercept bias on faint fronts. Columns whose support is weak (front not yet
-    # in the band) stay NaN, so the front may enter at any time.
+    # --- Per-column leading edge around the seed line ---
+    # The front direction is fixed downward (reacted/dark above, unreacted/light below),
+    # so per column we take the LEADING edge: within the window around the seed line,
+    # scanning from the unreacted (advancing) side -- the bottom of the window -- toward
+    # the reacted region, the FIRST row whose response crosses the edge threshold. This
+    # is the deepest crossing in the window. The bubble-banded interior sits BEHIND the
+    # front (above it) and is therefore excluded; an intensity-weighted centroid would
+    # instead average that banding in and be pulled shallow off the true edge (the
+    # V70_800 failure). Columns with no crossing in the window stay NaN, so the front may
+    # enter the band at any time.
     front_band = np.full(n_frames, np.nan)
-    strength = np.zeros(n_frames)
     if not np.isnan(seed_slope):
         pred_rows = seed_slope * t_idx + seed_inter
         for t in range(t_start, n_frames):
@@ -171,15 +175,11 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
             hi = int(min(band_h, np.ceil(pred_rows[t] + half) + 1))
             if hi - lo < 3:
                 continue
-            seg = L[lo:hi, t]
-            s = float(seg.sum())
-            strength[t] = s
-            if s > 0:
-                front_band[t] = float((np.arange(lo, hi) * seg).sum() / s)
-        gate = CENTROID_GATE * float(strength.max())
-        front_band[strength < gate] = np.nan
+            crossings = np.nonzero(L[lo:hi, t] >= edge_thr)[0]
+            if crossings.size:
+                front_band[t] = float(lo + crossings[-1])
 
-    # --- Robust fit of the centroid trace: Theil-Sen seed -> OLS on inliers ---
+    # --- Robust fit of the leading-edge trace: Theil-Sen seed -> OLS on inliers ---
     valid_cols = ~np.isnan(front_band)
     if valid_cols.sum() >= min_support:
         xs = t_idx[valid_cols].astype(float)
@@ -226,7 +226,7 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
     print(f"  Status: {status}, Speed: {speed:.3f} {speed_unit}, "
           f"coverage: {coverage_frac:.2f}, fill: {fill_frac:.2f}")
 
-    # Per-column centroid trace (gated) and the fitted diagonal, both in full-frame px.
+    # Per-column leading-edge trace and the fitted diagonal, both in full-frame px.
     times = np.arange(n_frames) / fps
     front_raw = np.where(~np.isnan(front_band), band_top + front_band, np.nan)
     front_fit = (band_top + slope * np.arange(n_frames) + intercept
@@ -239,12 +239,12 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
         'front_y_px_fit': front_fit,
     }).to_csv(os.path.join(OUTPUT_DATA_DIR, f'{stem}_position_time.csv'), index=False)
 
-    # Position-vs-time plot: gated ridge points + fitted diagonal
+    # Position-vs-time plot: leading-edge points + fitted diagonal
     t_cut_s = t_start / fps
     fit_label = (f'Fit: {speed:.2f} {speed_unit}, '
                  f'cov={coverage_frac:.2f}, fill={fill_frac:.2f}')
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.scatter(times, front_raw, s=4, alpha=0.5, label='Front centroid')
+    ax.scatter(times, front_raw, s=4, alpha=0.5, label='Front leading edge')
     if not np.isnan(slope):
         ax.plot(times, front_fit, 'r-', label=fit_label)
     ax.axvspan(times[0], t_cut_s, color='gray', alpha=0.15, label='Ignored start')
@@ -263,7 +263,7 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
     figk, axk = plt.subplots(figsize=(8, 5))
     axk.imshow(L, cmap='gray_r', aspect='auto', origin='upper',
                extent=[times[0], times[-1], band_bottom, band_top])
-    axk.scatter(times, front_raw, s=4, c='tab:blue', alpha=0.5, label='Front centroid')
+    axk.scatter(times, front_raw, s=4, c='tab:blue', alpha=0.5, label='Front leading edge')
     if not np.isnan(slope):
         axk.plot(times, front_fit, 'r-', lw=1.5, label=fit_label)
     axk.axvspan(times[0], t_cut_s, color='tab:red', alpha=0.10, label='Ignored start')
