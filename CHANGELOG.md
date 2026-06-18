@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0] - 2026-06-18
+
+### Changed
+- `process_videos.py`: front speed is now measured by **detecting and fitting the
+  diagonal line on the kymograph** directly, replacing the per-frame
+  Viterbi ridge tracker. Every run's kymograph shows one clear diagonal (the
+  travelling front) regardless of bubbling or how faint the line is, so the front
+  is no longer tracked frame-by-frame: the dominant diagonal is found with a
+  probabilistic Hough transform (`cv2.HoughLinesP`) and least-squares fit to its
+  supporting ridge pixels; the slope is the front speed.
+- `process_videos.py`: the kymograph `L[y, t]` is built over the **whole frame**
+  (polarity-agnostic vertical second derivative `|d^2 I/dy^2|`, `LINE_KSIZE`,
+  averaged across the full width). Each row's temporal median is subtracted to
+  cancel static horizontal features (tube bottom, meniscus, fixed markings),
+  leaving the moving front as the dominant diagonal. Only downward (`slope > 0`)
+  diagonals are accepted.
+- `process_videos.py`: **removed all analysis-region machinery** — the
+  hard-coded `MONITOR_BAND_*` middle-50% band, `ROI`, `EDGE_MARGIN_FRACTION`, the
+  Viterbi `RIDGE_GATE` / `RIDGE_MAX_STEP_FRACTION`, and the temporal-smoothing /
+  outlier-rejection pipeline. The whole video is analyzed. New tuning knobs:
+  `RIDGE_PCTL`, `MIN_LINE_FRAC`, `INLIER_TOL_FRAC`.
+- `process_videos.py`: diagnostics updated — the kymograph image overlays the
+  fitted diagonal, the position-time plot shows the raw per-column ridge plus the
+  fit, and the annotated video draws the fitted front line (no band rectangle).
+
 ## [0.6.0] - 2026-06-18
 
 ### Changed
