@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0] - 2026-06-18
+
+### Changed
+- `process_videos.py`: **added a real front-speed floor so the Radon seed can no longer
+  lock onto a near-horizontal bubble band.** On bubbly samples (`AIBN_300_1`, `V70_800_1`)
+  the search seeded on a dark, continuous band fitting ~0.06–0.08 px/s and passed as `OK`:
+  the band is continuous and spans the time axis, so the coverage/fill gates cannot reject
+  it — only a real speed floor can. One constant now drives both halves: replaced
+  `SLOPE_MIN_TRAVEL_FRAC` with **`MIN_FRONT_SPEED_PX_S = 0.1`** (px/s). (1) It floors the
+  Radon slope range — `m_min = MIN_FRONT_SPEED_PX_S / fps` (rows/frame) — so sub-floor
+  lines leave the candidate set and the seed lands on the diagonal (the leading-edge window
+  then follows it). (2) It is a **minimum-speed acceptance gate** alongside coverage and
+  fill: `speed_px_s >= MIN_FRONT_SPEED_PX_S` is required, else `FAILED_NO_STABLE_FRONT`.
+  0.1 px/s sits above the bands (0.06–0.08) and below the slowest real front (~0.28), so it
+  drops the bands and keeps every real front; the floor is a true 0.1 px/s at any fps
+  because `speed_px_s = slope * fps`. The response function, leading-edge pick,
+  `START_FRACTION`, and the coverage/fill gates are unchanged.
+
 ## [0.12.0] - 2026-06-18
 
 ### Changed
