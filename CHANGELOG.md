@@ -2,6 +2,41 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0] - 2026-06-18
+
+### Changed
+- `process_videos.py`: front detection rebuilt as a **horizontal-line ridge
+  tracker** for the refractive-index front, which has no significant brightness
+  or color step. Each band frame is run through a polarity-agnostic vertical
+  second-derivative line detector (`|d^2 I / dy^2|`, `LINE_KSIZE`) that responds
+  to a thin horizontal line whether it reads slightly dark or bright; the
+  response is averaged across the tube width (width-coherence collapse) so a
+  full-width front survives while local bubbles/glints are diluted. The
+  per-frame profiles are stacked into a **line-response kymograph** `L[y, t]`,
+  replacing the previous intensity-gradient (`|dI/dy|`) kymograph that latched
+  onto lighting/walls/bubbles.
+- `process_videos.py`: the front is now tracked with a **continuity-constrained
+  dynamic-programming (Viterbi) ridge** — a single connected, downward-only,
+  bounded-speed trajectory maximising the summed line response — instead of an
+  independent per-column `argmax`. The ridge may enter the band at any time:
+  columns whose line strength falls below `RIDGE_GATE` stay `NaN`.
+- `process_videos.py`: the monitoring band is the **middle 50% both vertically
+  and horizontally** (`MONITOR_BAND_TOP/BOTTOM_FRACTION` = 0.25/0.75,
+  `MONITOR_BAND_LEFT/RIGHT_FRACTION` = 0.25/0.75). The horizontal crop excludes
+  tube walls, meniscus glints, and background so the width-collapse averages
+  only over the clear inside of the tube.
+- `process_videos.py`: the diagnostic kymograph now shows the line-response
+  image (`magma`), and the annotated video draws the full middle-50% rectangle
+  (both vertical and horizontal boundaries) plus the tracked front line.
+
+### Added
+- `process_videos.py`: new parameters `MONITOR_BAND_LEFT_FRACTION`,
+  `MONITOR_BAND_RIGHT_FRACTION`, `LINE_KSIZE`, `RIDGE_GATE`, and
+  `RIDGE_MAX_STEP_FRACTION` (max downward ridge step per frame).
+
+### Removed
+- `process_videos.py`: `KYMO_EDGE_GATE` and the intensity-gradient front tracker.
+
 ## [0.5.0] - 2026-06-17
 
 ### Changed

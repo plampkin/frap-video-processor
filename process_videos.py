@@ -24,19 +24,32 @@ CALIBRATION_MM_PER_PX = None  # Set to e.g. 0.1 for 0.1 mm/px; None reports px/s
 ROI = None  # (x, y, w, h) crop to tube region, or None for full frame
 # Fronts are initiated at the top with a soldering iron and travel downward.
 FRONT_DIRECTION = 'down'
-# The front is only searched for within the middle 33% of the frame height:
-# the top third (initial test-tube jostling + soldering-iron initiation) and the
-# bottom third (end-of-tube plateau) are excluded. The front is not moving at the
-# start of the video and may enter this band at any time.
-MONITOR_BAND_TOP_FRACTION = 1.0 / 3.0
-MONITOR_BAND_BOTTOM_FRACTION = 2.0 / 3.0
+# The front is only searched for within the middle 50% of the frame, both
+# vertically and horizontally. Vertically, the top quarter (initial test-tube
+# jostling + soldering-iron initiation) and the bottom quarter (end-of-tube
+# plateau) are excluded. Horizontally, the left/right quarters (tube walls,
+# meniscus glints, background) are excluded so the width-collapse averages only
+# over the clear inside of the tube. The front is not moving at the start of the
+# video and may enter this band at any time.
+MONITOR_BAND_TOP_FRACTION = 0.25
+MONITOR_BAND_BOTTOM_FRACTION = 0.75
+MONITOR_BAND_LEFT_FRACTION = 0.25
+MONITOR_BAND_RIGHT_FRACTION = 0.75
 # Fraction of the band height treated as edge-pinning (front not yet entered, or
 # fully reacted plateau) and excluded from the speed fit.
 EDGE_MARGIN_FRACTION = 0.02
-# Kymograph smoothing kernel (odd) and the relative edge-strength gate below which
-# a time column is treated as "front not present" (NaN).
+# Line-response kymograph smoothing kernel (odd) and the kernel size of the
+# vertical second-derivative line detector used to find the thin horizontal
+# refractive-index front line (polarity-agnostic via magnitude).
 KYMO_SMOOTH = 5
-KYMO_EDGE_GATE = 0.30
+LINE_KSIZE = 3
+# Relative line-strength gate below which a time column is treated as
+# "front not present" (NaN), so the front may enter the band at any time.
+RIDGE_GATE = 0.30
+# Max downward step of the tracked ridge between consecutive frames, as a
+# fraction of the band height. Enforces a bounded, continuous, downward-only
+# front trajectory during the dynamic-programming ridge track.
+RIDGE_MAX_STEP_FRACTION = 0.06
 
 results = []
 
@@ -69,42 +82,79 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
     frames_gray = np.array(frames_gray)
     n_frames, roi_h, roi_w = frames_gray.shape
 
-    # Restrict all analysis to the middle 33% band of the frame height.
+    # Restrict all analysis to the middle 50% band of the frame, both vertically
+    # (drop initiation/jostling above, end-of-tube plateau below) and horizontally
+    # (drop tube walls / glints / background, keep the clear inside of the tube).
     band_top = int(roi_h * MONITOR_BAND_TOP_FRACTION)
     band_bottom = int(roi_h * MONITOR_BAND_BOTTOM_FRACTION)
-    band_frames = frames_gray[:, band_top:band_bottom, :]
-    band_h = band_frames.shape[1]
+    band_left = int(roi_w * MONITOR_BAND_LEFT_FRACTION)
+    band_right = int(roi_w * MONITOR_BAND_RIGHT_FRACTION)
+    band_frames = frames_gray[:, band_top:band_bottom, band_left:band_right]
+    band_h, band_w = band_frames.shape[1], band_frames.shape[2]
 
     # Fronts are top-initiated and travel downward; direction is fixed, not auto-detected.
     front_direction = FRONT_DIRECTION
 
-    # --- Kymographic front tracking ---
-    # Collapse each frame to a 1-D vertical intensity profile (median across the
-    # tube width) inside the monitoring band, then stack the per-frame profiles
-    # column-by-column into a space-time kymograph: rows = vertical position
-    # within the band, columns = frame index (time). The reaction front is the
-    # moving boundary between reacted and unreacted material, which appears as a
-    # single tilted edge sweeping across the kymograph; its slope is the speed.
-    kymo = np.median(band_frames, axis=2).T.astype(np.float32)  # (band_h, n_frames)
-    kymo = cv2.GaussianBlur(kymo, (KYMO_SMOOTH, KYMO_SMOOTH), 0)
+    # --- Horizontal-line ridge tracking ---
+    # The front is a refractive-index discontinuity with no significant brightness
+    # or color step, so a mean-intensity-gradient tracker latches onto lighting /
+    # walls / bubbles. The one invariant is that the front is a thin, near-horizontal
+    # line spanning the full tube width (regardless of whether the reacted region
+    # above is bubbly, textured, or clear). We detect that line directly.
+    #
+    # 1. Per-frame polarity-agnostic line response: the vertical second derivative
+    #    |d^2 I / dy^2| peaks at a thin horizontal line whether it reads slightly
+    #    dark or slightly bright, and is insensitive to a smooth region brightness
+    #    step. 2. Width-coherence collapse: average the response across the tube
+    #    width. A full-width front survives; a local bubble/glint at one x is
+    #    diluted away. Stacking the per-frame width-collapsed profiles gives a
+    #    line-response kymograph L[y, t] (rows = position in band, cols = time).
+    L = np.empty((band_h, n_frames), dtype=np.float32)
+    for t in range(n_frames):
+        f = band_frames[t].astype(np.float32)
+        d2y = cv2.Sobel(f, cv2.CV_32F, 0, 2, ksize=LINE_KSIZE)
+        L[:, t] = np.abs(d2y).mean(axis=1)
+    L = cv2.GaussianBlur(L, (KYMO_SMOOTH, KYMO_SMOOTH), 0)
+    kymo = L  # diagnostic image is the line-response kymograph
 
-    # Vertical intensity gradient: |dI/dy| peaks at the reacted/unreacted edge in
-    # each time column. Tracking the gradient edge is robust to the absolute
-    # brightness of either phase (no per-frame thresholding / morphology needed).
-    grad_mag = np.abs(cv2.Sobel(kymo, cv2.CV_32F, 0, 1, ksize=3))
+    # 3. Track a single downward ridge with a continuity constraint, instead of an
+    #    independent per-column argmax (which jumps between spurious responses).
+    #    Forward Viterbi pass: the path may move down only and at most K rows per
+    #    frame, maximising the summed line response. This yields one connected,
+    #    monotonic, bounded-speed front trajectory.
+    K = max(1, int(band_h * RIDGE_MAX_STEP_FRACTION))
+    score = L[:, 0].astype(np.float64).copy()
+    back = np.zeros((n_frames, band_h), dtype=np.int32)
+    back[0] = np.arange(band_h)
+    rows = np.arange(band_h)
+    for t in range(1, n_frames):
+        m = score.copy()                       # best reachable predecessor score
+        src = rows.copy()                      # ...and the row it came from
+        for k in range(1, K + 1):
+            cand = score[:-k]                  # predecessor row y-k for outputs y>=k
+            better = cand > m[k:]
+            m[k:] = np.where(better, cand, m[k:])
+            src[k:] = np.where(better, rows[:-k], src[k:])
+        score = L[:, t].astype(np.float64) + m
+        back[t] = src
 
-    # Per-column (per-frame) front = row of strongest edge, gated so columns the
-    # front has not yet entered (weak edge) stay undetected (NaN). The front can
-    # therefore appear at any time rather than being assumed present from frame 0.
-    col_max = grad_mag.max(axis=0)
-    gate = KYMO_EDGE_GATE * float(np.nanmax(col_max))
-    front_band = np.argmax(grad_mag, axis=0).astype(float)
-    front_band[col_max < gate] = np.nan
+    # Backtrack the optimal path from the strongest end state.
+    path = np.empty(n_frames, dtype=np.int64)
+    path[-1] = int(np.argmax(score))
+    for t in range(n_frames - 1, 0, -1):
+        path[t - 1] = back[t][path[t]]
+
+    # 4. The front may enter the band at any time: gate out columns whose line
+    #    response along the path is weak (front not yet arrived / already gone).
+    strength = L[path, np.arange(n_frames)]
+    gate = RIDGE_GATE * float(np.nanmax(strength))
+    front_band = path.astype(float)
+    front_band[strength < gate] = np.nan
 
     # Convert band-relative rows to absolute frame-row coordinates.
     front_positions = band_top + front_band
 
-    print(f"  Kymograph {kymo.shape[0]}x{kymo.shape[1]}, direction: {front_direction}, "
+    print(f"  Line-response kymograph {L.shape[0]}x{L.shape[1]}, direction: {front_direction}, "
           f"front detected in {int(np.sum(~np.isnan(front_positions)))}/{n_frames} frames")
 
     # Temporal outlier rejection: flag jumps > 2× median frame-to-frame displacement
@@ -187,10 +237,10 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
     fig.savefig(os.path.join(OUTPUT_IMAGE_DIR, f'{stem}_position_time.png'), dpi=150)
     plt.close(fig)
 
-    # Kymograph diagnostic: space-time image (x=time, y=absolute frame row) with
-    # the monitoring band, the tracked front, and the fitted speed line overlaid.
+    # Diagnostic: line-response kymograph (x=time, y=absolute frame row) with the
+    # monitoring band, the tracked ridge, and the fitted speed line overlaid.
     figk, axk = plt.subplots(figsize=(8, 5))
-    axk.imshow(kymo, cmap='gray', aspect='auto',
+    axk.imshow(kymo, cmap='magma', aspect='auto',
                extent=[times[0], times[-1], band_bottom, band_top])
     axk.plot(times, smooth, '.', color='cyan', ms=2, label='Tracked front')
     if not np.isnan(slope):
@@ -200,7 +250,7 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
     axk.axhline(band_bottom, color='yellow', lw=1)
     axk.set_xlabel('Time (s)')
     axk.set_ylabel('Front position (px)')
-    axk.set_title(f'{stem} kymograph\n{speed:.2f} {speed_unit}  [{status}]')
+    axk.set_title(f'{stem} line-response kymograph\n{speed:.2f} {speed_unit}  [{status}]')
     axk.legend()
     figk.tight_layout()
     figk.savefig(os.path.join(OUTPUT_IMAGE_DIR, f'{stem}_kymograph.png'), dpi=150)
@@ -216,17 +266,21 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
 
     band_top_abs = band_top + roi_y_offset
     band_bottom_abs = band_bottom + roi_y_offset
+    band_left_abs = band_left + roi_x_offset
+    band_right_abs = band_right + roi_x_offset
 
     for i, front_y in enumerate(smooth):
         ret, frame = cap2.read()
         if not ret:
             break
-        # Monitoring band boundaries (middle 50% of the frame)
-        cv2.line(frame, (roi_x_offset, band_top_abs), (roi_x_offset + roi_width, band_top_abs), (255, 255, 0), 1)
-        cv2.line(frame, (roi_x_offset, band_bottom_abs), (roi_x_offset + roi_width, band_bottom_abs), (255, 255, 0), 1)
+        # Monitoring band: middle 50% vertically and horizontally
+        cv2.line(frame, (band_left_abs, band_top_abs), (band_right_abs, band_top_abs), (255, 255, 0), 1)
+        cv2.line(frame, (band_left_abs, band_bottom_abs), (band_right_abs, band_bottom_abs), (255, 255, 0), 1)
+        cv2.line(frame, (band_left_abs, band_top_abs), (band_left_abs, band_bottom_abs), (255, 255, 0), 1)
+        cv2.line(frame, (band_right_abs, band_top_abs), (band_right_abs, band_bottom_abs), (255, 255, 0), 1)
         if not np.isnan(front_y):
             fy_abs = int(front_y) + roi_y_offset
-            cv2.line(frame, (roi_x_offset, fy_abs), (roi_x_offset + roi_width, fy_abs), (0, 0, 255), 2)
+            cv2.line(frame, (band_left_abs, fy_abs), (band_right_abs, fy_abs), (0, 0, 255), 2)
         label = f'{speed:.2f} {speed_unit}  [{status}]'
         cv2.putText(frame, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
         out.write(frame)
