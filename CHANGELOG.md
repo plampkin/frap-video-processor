@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.0] - 2026-06-18
+
+### Changed
+- `process_videos.py`: **replaced the Hough-on-partial-kymograph fit with a wide-range
+  Radon line-integral search** so the fit is robust to wildly-varying front speeds,
+  heavy bubble banding, and faint fronts. The diagonal is found by summing the
+  kymograph response along every candidate **downward** line `y = m·t + b` over a wide
+  slope range (`N_SLOPES = 240`, bounded by `SLOPE_MIN_TRAVEL_FRAC` /
+  `MIN_TRANSIT_FRAC`): integrating the whole line lifts a faint front out of the noise,
+  and near-horizontal lines are excluded so bubble bands / residual static features can
+  never win. The winning line seeds a **per-column intensity-weighted centroid** trace
+  (one sub-pixel front position per frame, `CENTROID_HALF_FRAC`, gated by
+  `CENTROID_GATE`), which is then fit robustly (**Theil-Sen → OLS** on inliers). This
+  fixes the bubbly-sample failures (`AIBN_300_1`, `V70_800_1`) and the shallow-slope
+  bias on faint fronts (`V65_800_1`, `V70_1500_1`).
+- `process_videos.py`: **dropped the fixed first-1/3 time cut** — the front may now
+  enter the band at any time; weak columns simply stay `NaN`. Removed
+  `FIT_START_FRACTION`, `RIDGE_PCTL`, `HOUGH_MIN_LINE_FRAC`, `HOUGH_MAX_GAP_FRAC`;
+  added `N_SLOPES`, `SLOPE_MIN_TRAVEL_FRAC`, `MIN_TRANSIT_FRAC`, `MIN_SUPPORT_FRAC`,
+  `CENTROID_HALF_FRAC`, `CENTROID_GATE`.
+- `process_videos.py`: kymographs stay grayscale (`gray_r`, intense = black); the
+  tracked front centroids are overlaid alongside the fitted diagonal.
+
 ## [0.9.0] - 2026-06-18
 
 ### Changed
