@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.0] - 2026-06-18
+
+### Changed
+- `process_videos.py`: **the diagonal fit no longer uses the whole plot.** The early
+  part of the kymograph behaves differently from the steady diagonal (the test-tube
+  jostling + soldering-iron initiation form a bright blob before the front enters the
+  band), which skewed the whole-plot fit. The fit now (1) **ignores the first third**
+  of the time axis (`FIT_START_FRACTION = 1/3`), (2) keeps only the **most-intense**
+  ridge pixels (`RIDGE_PCTL = 92`), and (3) **returns to a Hough transform** on that
+  partial kymograph: the longest downward Hough segment seeds the diagonal, then an
+  OLS refit on its supporting ridge pixels gives the slope (front speed). Replaced
+  the Theil-Sen per-column trace; added `FIT_START_FRACTION`, `RIDGE_PCTL`,
+  `HOUGH_MIN_LINE_FRAC`, `HOUGH_MAX_GAP_FRAC`; removed `RIDGE_GATE`.
+- `process_videos.py`: **kymograph images are now grayscale with the most-intense
+  signal rendered black** (`cmap='gray_r'`) for readability, and the ignored first
+  third is shaded on both the kymograph and the position-time plot.
+
 ## [0.8.0] - 2026-06-18
 
 ### Changed
