@@ -1,6 +1,6 @@
-video,status,speed_px_per_s,r2,direction,monomer,initiator,amount,replicate,sample
-input_videos/AIBN_300_1_S2.mov,FAILED_NO_STABLE_FRONT,,,down,AIBN,300,1,S2,
-input_videos/IBA_V65_14001_S2.mov,OK,0.4974,0.9945,down,IBA,V65,14001,S2,
-input_videos/V65_800_1_S1.mov,OK,0.4552,0.9881,down,V65,800,1,S1,
-input_videos/V70_1500_1_S2.mov,OK,0.4694,0.9556,down,V70,1500,1,S2,
-input_videos/V70_800_1_S2.mov,FAILED_NO_STABLE_FRONT,,,down,V70,800,1,S2,
+video,status,speed_px_per_s,coverage,fill,direction,monomer,initiator,amount,replicate,sample
+input_videos/AIBN_300_1_S2.mov,OK,0.0198,0.6665,1.0,down,AIBN,300,1,S2,
+input_videos/IBA_V65_14001_S2.mov,OK,0.0868,1.0,1.0,down,IBA,V65,14001,S2,
+input_videos/V65_800_1_S1.mov,FAILED_NO_STABLE_FRONT,0.0871,0.4273,1.0,down,V65,800,1,S1,
+input_videos/V70_1500_1_S2.mov,OK,0.5589,0.9792,1.0,down,V70,1500,1,S2,
+input_videos/V70_800_1_S2.mov,OK,0.2197,0.7722,1.0,down,V70,800,1,S2,
