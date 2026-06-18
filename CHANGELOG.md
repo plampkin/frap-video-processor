@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.14.0] - 2026-06-18
+
+### Changed
+- `process_videos.py`: **the Radon seed score is now ridge contrast, not mean response
+  along the line.** On bubbly samples (`AIBN_300_1`) the front trace started on the steep
+  diagonal then bent flat onto a horizontal bubble band: the band still won the Radon seed,
+  and the 0.13.0 speed floor only clamped the band fit up to the floor (~0.11 px/s) rather
+  than excluding it. In the `|d²I/dy²|` kymograph the front is a thin ridge while the bubble
+  band is a thick dark blob, and the old score (mean response along the line) rewarded any
+  near-horizontal line lying *inside* that blob. The score is now
+  `on_line_mean - 0.5 * (up_mean + down_mean)`, gathering `L` at a parallel offset above and
+  below the candidate line (`target ± off`, clipped into range) as well as on it. A thin
+  front scores high (dark on the line, light just off it); a thick band scores ~0 (dark on
+  and off the line). Added **`RIDGE_OFFSET_FRAC = 0.03`** with
+  `off = max(2, int(RIDGE_OFFSET_FRAC * band_h))` — wider than the front ridge, narrower
+  than a band. The valid mask, the `min_support` gate, and the argmax selection are
+  unchanged, as are `MIN_FRONT_SPEED_PX_S = 0.1`, the leading-edge pick, `START_FRACTION`,
+  and the coverage/fill gates.
+
 ## [0.13.0] - 2026-06-18
 
 ### Changed

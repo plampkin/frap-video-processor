@@ -47,6 +47,8 @@ KYMO_SMOOTH = 5                 # Gaussian smoothing of the kymograph (odd)
 START_FRACTION = 1.0 / 3.0      # ignore the first ~1/3 (jostling + initiation transient)
 EDGE_PCTL = 80                  # edge-presence threshold percentile (retained region only)
 N_SLOPES = 240                  # number of candidate downward slopes in the Radon search
+RIDGE_OFFSET_FRAC = 0.03        # ridge-contrast offset (frac of band height): wider than the
+                                # front ridge, narrower than a bubble band
 MIN_FRONT_SPEED_PX_S = 0.1      # real speed floor (px/s): drops near-horizontal bubble bands
 MIN_TRANSIT_FRAC = 0.05         # fastest front: can't cross the band in < this frac of frames
 MIN_SUPPORT_FRAC = 0.15         # a candidate line must span >= this frac of retained frames
@@ -123,11 +125,16 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
 
     # --- Find the dominant downward diagonal with a wide-range Radon search ---
     # The front speed varies wildly between runs, so we search a WIDE band of downward
-    # slopes. For each candidate line y = m*t + b we sum the kymograph response along
-    # the line (normalized by its in-frame length), over the retained columns only.
-    # Summing the whole line lifts a faint front out of the noise; near-horizontal lines
-    # are excluded by the slope range, so bubble bands / residual static features can
-    # never accumulate. The maximizing (m, b) seeds the per-column leading-edge trace below.
+    # slopes. For each candidate line y = m*t + b we score the RIDGE CONTRAST: the mean
+    # response on the line minus the mean response at a parallel offset above and below it,
+    # over the retained columns only. The front is a thin ridge -- dark on the line, light
+    # just off it -- so it scores high; a thick dark bubble band is dark both on and off the
+    # line, so it scores ~0. A plain mean-along-the-line score instead rewards any
+    # near-horizontal line lying inside the thick band (the AIBN_300_1 failure), since the
+    # band's interior is uniformly high. The offset (RIDGE_OFFSET_FRAC of the band height)
+    # is wider than the front ridge but narrower than a band. Near-horizontal lines are also
+    # excluded by the slope range, so static features can never win. The maximizing (m, b)
+    # seeds the per-column leading-edge trace below.
     slope = intercept = speed_px_s = np.nan
     coverage_frac = fill_frac = np.nan
     n_inliers = 0
@@ -143,15 +150,22 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
 
     best_score = -1.0
     seed_slope = seed_inter = np.nan
+    off = max(2, int(RIDGE_OFFSET_FRAC * band_h))            # ridge-contrast offset (rows)
     for m in slopes:
         shifts = np.round(m * t_idx).astype(int)              # row offset of the line per column
         target = b_idx[:, None] + shifts[None, :]            # row index hit at each (b, t)
         valid = (target >= 0) & (target < band_h)
         valid[:, :t_start] = False                           # retained columns only
-        gathered = L[np.clip(target, 0, band_h - 1), t_idx[None, :]]
-        gathered[~valid] = 0.0
+        on_line = L[np.clip(target, 0, band_h - 1), t_idx[None, :]]
+        up = L[np.clip(target - off, 0, band_h - 1), t_idx[None, :]]
+        down = L[np.clip(target + off, 0, band_h - 1), t_idx[None, :]]
+        on_line[~valid] = 0.0
+        up[~valid] = 0.0
+        down[~valid] = 0.0
         cnt = valid.sum(axis=1)
-        score = np.where(cnt >= min_support, gathered.sum(axis=1) / np.maximum(cnt, 1), 0.0)
+        denom = np.maximum(cnt, 1)
+        contrast = on_line.sum(axis=1) / denom - 0.5 * (up.sum(axis=1) + down.sum(axis=1)) / denom
+        score = np.where(cnt >= min_support, contrast, 0.0)
         bi = int(np.argmax(score))
         if score[bi] > best_score:
             best_score = float(score[bi])
