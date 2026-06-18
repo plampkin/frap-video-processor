@@ -2,6 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.0] - 2026-06-18
+
+### Changed
+- `process_videos.py`: **the front is now fit as the leading unreacted→reacted edge,
+  not a thin line.** The kymograph response is built from the signed vertical **first
+  derivative** (positive part of `dI/dy`, `EDGE_KSIZE`) instead of the polarity-agnostic
+  second derivative `|d²I/dy²|`. Reacted is dark/above and unreacted is light/below, so a
+  top→bottom column scan steps *up* in brightness at the front (`dI/dy > 0`); keeping only
+  the positive part fires on that transition while the uniform dark interior behind the
+  front and the horizontal bubble banding contribute ~zero. This fixes the bubbly-sample
+  failure (`V70_800_1`), where the dark interior and bubble bands previously outvoted the
+  real edge, and the shallow bias on faint fronts. Renamed `LINE_KSIZE` → `EDGE_KSIZE`.
+- `process_videos.py`: **re-added a start-time cut** (`START_FRACTION = 1/3`). The first
+  ~⅓ of the time axis (test-tube jostling + soldering-iron initiation) is excluded from
+  the edge-threshold estimate, the Radon line search, the centroid trace, and the fit;
+  the steady diagonal persists well past the cut, so the steady-state speed is unaffected.
+  The ignored region is shaded on the position-time and kymograph diagnostics.
+- `process_videos.py`: **the edge-presence threshold is computed on the retained region
+  only** (`EDGE_PCTL` percentile over post-cut columns), so dense early initiation blobs
+  cannot bias the percentile.
+- `process_videos.py`: **accept/reject is now on geometry, not R².** R² is ~1 by
+  construction here (points are selected for lying on a line), so the `R² < 0.80` gate is
+  replaced by two geometric gates: **time coverage** (inliers span ≥ `MIN_COVERAGE_FRAC`
+  of the post-cut time axis) and **fill / continuity** (≥ `MIN_FILL_FRAC` of the spanned
+  columns carry a front pixel above the edge threshold). The downward-slope requirement
+  (`slope > 0`) is kept; `FAILED_NO_STABLE_FRONT` if either gate fails. Both metrics are
+  reported in the console, the plots, and `front_speed_results.csv` (the `r2` column is
+  replaced by `coverage` and `fill`). Added `START_FRACTION`, `EDGE_PCTL`,
+  `MIN_COVERAGE_FRAC`, `MIN_FILL_FRAC`; `MIN_SUPPORT_FRAC` is now relative to the
+  retained frame count.
+
 ## [0.10.0] - 2026-06-18
 
 ### Changed
