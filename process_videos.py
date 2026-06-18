@@ -30,18 +30,21 @@ BAND_LEFT_FRACTION = 0.25
 BAND_RIGHT_FRACTION = 0.75
 # The front is a thin, near-horizontal refractive-index line that sweeps downward.
 # On the space-time kymograph it shows up as one clear diagonal line whose slope is
-# the front speed (rows per frame). The early part of the plot behaves differently
-# (test-tube jostling + soldering-iron initiation produce a bright blob before the
-# front enters the band), which skews any whole-plot fit. So we (1) drop the first
-# third of the time axis, (2) keep only the most-intense ridge pixels, and (3) detect
-# the dominant downward diagonal with a Hough transform on that partial kymograph,
-# then least-squares refine on its inliers.
+# the front speed (rows per frame). The front speed can vary wildly between runs, so
+# we do NOT assume a narrow speed range. Instead we find the diagonal with a Radon-
+# style line-integral search over a WIDE range of downward slopes: summing the
+# kymograph response along each candidate line raises the SNR of a faint front, and
+# near-horizontal lines (bubble bands / residual static features) are excluded by the
+# slope range so they can never win. The maximizing line seeds a per-column centroid
+# trace, which is then fit robustly (Theil-Sen -> OLS).
 LINE_KSIZE = 3                  # vertical 2nd-derivative kernel (front-line detector)
 KYMO_SMOOTH = 5                 # Gaussian smoothing of the kymograph (odd)
-FIT_START_FRACTION = 1/3        # ignore the first third of the plot (jostling/initiation)
-RIDGE_PCTL = 92                 # keep only ridge pixels >= this percentile (most intense)
-HOUGH_MIN_LINE_FRAC = 0.25      # min diagonal length, as a fraction of the partial time span
-HOUGH_MAX_GAP_FRAC = 0.10       # max gap to bridge along the diagonal (fraction of time span)
+N_SLOPES = 240                  # number of candidate downward slopes in the Radon search
+SLOPE_MIN_TRAVEL_FRAC = 0.10    # slowest front: covers >= this frac of band over the whole video
+MIN_TRANSIT_FRAC = 0.05         # fastest front: can't cross the band in < this frac of frames
+MIN_SUPPORT_FRAC = 0.15         # a candidate line must span >= this frac of frames in-band
+CENTROID_HALF_FRAC = 0.06       # half-window (frac of band height) for the per-column centroid
+CENTROID_GATE = 0.20            # keep columns whose centroid support >= this frac of the peak
 INLIER_TOL_FRAC = 0.05          # fit inlier tolerance, as a fraction of band height
 
 results = []
@@ -98,60 +101,76 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
     # feature on the kymograph.
     L = np.clip(L - np.median(L, axis=1, keepdims=True), 0, None)
 
-    # --- Detect the diagonal with a Hough transform on the partial kymograph ---
-    # The first third of the plot behaves differently from the steady diagonal (the
-    # jostling/initiation blob lives there, before the front is in the band), so we
-    # ignore it. On the remaining columns we keep only the most-intense ridge pixels
-    # (a percentile threshold) so the diagonal is isolated, then run a probabilistic
-    # Hough transform and take the longest downward segment as the front. Finally we
-    # least-squares refine the slope on the ridge pixels that support that segment.
-    t_start = int(n_frames * FIT_START_FRACTION)
-    Lp = L[:, t_start:]                       # partial kymograph (time-cropped)
-    n_cols = Lp.shape[1]
-
-    thresh = np.percentile(Lp, RIDGE_PCTL)
-    mask = (Lp >= thresh).astype(np.uint8) * 255
-
+    # --- Find the dominant downward diagonal with a wide-range Radon search ---
+    # The front speed varies wildly between runs, so we search a WIDE band of downward
+    # slopes. For each candidate line y = m*t + b we sum the kymograph response along
+    # the line (normalized by its in-frame length). Summing the whole line lifts a
+    # faint front out of the noise; near-horizontal lines are excluded by the slope
+    # range, so bubble bands / residual static features can never accumulate. The
+    # maximizing (m, b) seeds the per-column centroid trace below.
     slope = intercept = speed_px_s = r2 = np.nan
     n_inliers = 0
     status = 'FAILED_NO_STABLE_FRONT'
 
-    min_len = max(10, int(HOUGH_MIN_LINE_FRAC * n_cols))
-    max_gap = max(1, int(HOUGH_MAX_GAP_FRAC * n_cols))
-    lines = cv2.HoughLinesP(mask, 1, np.pi / 180, threshold=min_len,
-                            minLineLength=min_len, maxLineGap=max_gap)
+    t_idx = np.arange(n_frames)
+    b_idx = np.arange(band_h)
+    m_min = SLOPE_MIN_TRAVEL_FRAC * band_h / n_frames          # slowest plausible front
+    m_max = band_h / max(1.0, MIN_TRANSIT_FRAC * n_frames)     # fastest plausible front
+    slopes = np.linspace(m_min, m_max, N_SLOPES)
+    min_support = max(10, int(MIN_SUPPORT_FRAC * n_frames))
 
-    if lines is not None:
-        # Longest segment that travels downward (row increases with time -> slope > 0).
-        best = None
-        best_len = 0.0
-        for x1, y1, x2, y2 in lines[:, 0, :]:
-            if x2 == x1:
-                continue
-            seg_slope = (y2 - y1) / (x2 - x1)
-            if seg_slope <= 0:
-                continue
-            length = float(np.hypot(x2 - x1, y2 - y1))
-            if length > best_len:
-                best_len = length
-                best = (seg_slope, y1 - seg_slope * x1)   # (slope, intercept) in partial coords
+    best_score = -1.0
+    seed_slope = seed_inter = np.nan
+    for m in slopes:
+        shifts = np.round(m * t_idx).astype(int)              # row offset of the line per column
+        target = b_idx[:, None] + shifts[None, :]            # row index hit at each (b, t)
+        valid = (target >= 0) & (target < band_h)
+        gathered = L[np.clip(target, 0, band_h - 1), t_idx[None, :]]
+        gathered[~valid] = 0.0
+        cnt = valid.sum(axis=1)
+        score = np.where(cnt >= min_support, gathered.sum(axis=1) / np.maximum(cnt, 1), 0.0)
+        bi = int(np.argmax(score))
+        if score[bi] > best_score:
+            best_score = float(score[bi])
+            seed_slope, seed_inter = float(m), float(bi)
 
-        if best is not None:
-            seed_slope, seed_inter = best
-            # Ridge pixels supporting the seed line -> refine the slope on them (in
-            # partial coords x measured from t_start, y = row within the band).
-            ys_px, xs_px = np.nonzero(mask)
-            pred = seed_slope * xs_px + seed_inter
-            inl = np.abs(ys_px - pred) < INLIER_TOL_FRAC * band_h
-            n_inliers = int(inl.sum())
-            if n_inliers >= 10:
-                res = stats.linregress(xs_px[inl].astype(float), ys_px[inl].astype(float))
-                if res.slope > 0:
-                    slope, r2 = res.slope, res.rvalue ** 2
-                    # Shift intercept back onto the full (un-cropped) frame time axis.
-                    intercept = res.intercept - res.slope * t_start
-                    speed_px_s = abs(slope) * fps
-                    status = 'OK' if r2 >= 0.80 else 'FAILED_NO_STABLE_FRONT'
+    # --- Per-column intensity-weighted centroid around the seed line ---
+    # One sub-pixel front position per frame (not a pixel cloud) removes the shallow-
+    # slope/intercept bias on faint fronts. Columns whose support is weak (front not yet
+    # in the band) stay NaN, so the front may enter at any time.
+    front_band = np.full(n_frames, np.nan)
+    strength = np.zeros(n_frames)
+    if not np.isnan(seed_slope):
+        pred_rows = seed_slope * t_idx + seed_inter
+        half = max(3, int(CENTROID_HALF_FRAC * band_h))
+        for t in t_idx:
+            lo = int(max(0, np.floor(pred_rows[t] - half)))
+            hi = int(min(band_h, np.ceil(pred_rows[t] + half) + 1))
+            if hi - lo < 3:
+                continue
+            seg = L[lo:hi, t]
+            s = float(seg.sum())
+            strength[t] = s
+            if s > 0:
+                front_band[t] = float((np.arange(lo, hi) * seg).sum() / s)
+        gate = CENTROID_GATE * float(strength.max())
+        front_band[strength < gate] = np.nan
+
+    # --- Robust fit of the centroid trace: Theil-Sen seed -> OLS on inliers ---
+    valid_cols = ~np.isnan(front_band)
+    if valid_cols.sum() >= min_support:
+        xs = t_idx[valid_cols].astype(float)
+        ys = front_band[valid_cols]
+        ts_slope, ts_inter, _, _ = stats.theilslopes(ys, xs)
+        inl = np.abs(ys - (ts_slope * xs + ts_inter)) < INLIER_TOL_FRAC * band_h
+        n_inliers = int(inl.sum())
+        if n_inliers >= 10:
+            res = stats.linregress(xs[inl], ys[inl])
+            if res.slope > 0:
+                slope, r2 = res.slope, res.rvalue ** 2
+                intercept = res.intercept                    # band coords, full time axis
+                speed_px_s = abs(slope) * fps
+                status = 'OK' if r2 >= 0.80 else 'FAILED_NO_STABLE_FRONT'
 
     if CALIBRATION_MM_PER_PX is not None:
         speed = speed_px_s * CALIBRATION_MM_PER_PX
@@ -164,13 +183,9 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
           f"kymograph {L.shape[0]}x{L.shape[1]}, fit inliers: {n_inliers}")
     print(f"  Status: {status}, Speed: {speed:.3f} {speed_unit}, R²: {r2:.4f}")
 
-    # Per-column ridge (most-intense pixels, fit region only) and the fitted diagonal,
-    # both in full-frame px coords.
+    # Per-column centroid trace (gated) and the fitted diagonal, both in full-frame px.
     times = np.arange(n_frames) / fps
-    col_peak = np.argmax(L, axis=0).astype(float)
-    col_max = L.max(axis=0)
-    show = (np.arange(n_frames) >= t_start) & (col_max >= thresh)
-    front_raw = np.where(show, band_top + col_peak, np.nan)
+    front_raw = np.where(~np.isnan(front_band), band_top + front_band, np.nan)
     front_fit = (band_top + slope * np.arange(n_frames) + intercept
                  if not np.isnan(slope) else np.full(n_frames, np.nan))
 
@@ -183,11 +198,10 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
 
     # Position-vs-time plot: gated ridge points + fitted diagonal
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.scatter(times, front_raw, s=2, alpha=0.3, label='Ridge (intense pixels)')
+    ax.scatter(times, front_raw, s=4, alpha=0.5, label='Front centroid')
     if not np.isnan(slope):
         ax.plot(times, front_fit, 'r-', label=f'Fit: {speed:.2f} {speed_unit}, R²={r2:.3f}')
     ax.axhspan(band_top, band_bottom, color='gray', alpha=0.08, label='Band')
-    ax.axvspan(times[0], times[t_start], color='red', alpha=0.08, label='Ignored (first 1/3)')
     ax.set_xlabel('Time (s)')
     ax.set_ylabel('Front position (px)')
     ax.set_ylim(H, 0)
@@ -202,9 +216,7 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
     figk, axk = plt.subplots(figsize=(8, 5))
     axk.imshow(L, cmap='gray_r', aspect='auto', origin='upper',
                extent=[times[0], times[-1], band_bottom, band_top])
-    # Shade the ignored first third (jostling/initiation) that is excluded from the fit.
-    axk.axvspan(times[0], times[t_start], color='red', alpha=0.10,
-                label='Ignored (first 1/3)')
+    axk.scatter(times, front_raw, s=4, c='tab:blue', alpha=0.5, label='Front centroid')
     if not np.isnan(slope):
         axk.plot(times, front_fit, 'r-', lw=1.5,
                  label=f'Fit: {speed:.2f} {speed_unit}, R²={r2:.3f}')
