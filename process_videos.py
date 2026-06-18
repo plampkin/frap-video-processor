@@ -28,24 +28,32 @@ BAND_TOP_FRACTION = 0.25
 BAND_BOTTOM_FRACTION = 0.75
 BAND_LEFT_FRACTION = 0.25
 BAND_RIGHT_FRACTION = 0.75
-# The front is a thin, near-horizontal refractive-index line that sweeps downward.
-# On the space-time kymograph it shows up as one clear diagonal line whose slope is
-# the front speed (rows per frame). The front speed can vary wildly between runs, so
-# we do NOT assume a narrow speed range. Instead we find the diagonal with a Radon-
-# style line-integral search over a WIDE range of downward slopes: summing the
-# kymograph response along each candidate line raises the SNR of a faint front, and
-# near-horizontal lines (bubble bands / residual static features) are excluded by the
-# slope range so they can never win. The maximizing line seeds a per-column centroid
-# trace, which is then fit robustly (Theil-Sen -> OLS).
-LINE_KSIZE = 3                  # vertical 2nd-derivative kernel (front-line detector)
+# The front is the leading unreacted->reacted EDGE: unreacted (light) ahead/below,
+# reacted (dark) behind/above. On a top->bottom column scan it is a light-below /
+# dark-above step, so the signed vertical FIRST derivative (positive part) fires on
+# that transition while the uniform dark interior behind the front and the horizontal
+# bubble banding contribute ~zero (and static bands are also killed by the temporal-
+# median subtraction). On the space-time kymograph the moving edge is one clear
+# diagonal whose slope is the front speed (rows per frame). The front speed can vary
+# wildly between runs, so we do NOT assume a narrow speed range. Instead we find the
+# diagonal with a Radon-style line-integral search over a WIDE range of downward
+# slopes: summing the kymograph response along each candidate line raises the SNR of a
+# faint front, and near-horizontal lines (bubble bands / residual static features) are
+# excluded by the slope range so they can never win. The maximizing line seeds a
+# per-column centroid trace, which is then fit robustly (Theil-Sen -> OLS).
+EDGE_KSIZE = 3                  # vertical 1st-derivative kernel (unreacted->reacted edge)
 KYMO_SMOOTH = 5                 # Gaussian smoothing of the kymograph (odd)
+START_FRACTION = 1.0 / 3.0      # ignore the first ~1/3 (jostling + initiation transient)
+EDGE_PCTL = 80                  # edge-presence threshold percentile (retained region only)
 N_SLOPES = 240                  # number of candidate downward slopes in the Radon search
 SLOPE_MIN_TRAVEL_FRAC = 0.10    # slowest front: covers >= this frac of band over the whole video
 MIN_TRANSIT_FRAC = 0.05         # fastest front: can't cross the band in < this frac of frames
-MIN_SUPPORT_FRAC = 0.15         # a candidate line must span >= this frac of frames in-band
+MIN_SUPPORT_FRAC = 0.15         # a candidate line must span >= this frac of retained frames
 CENTROID_HALF_FRAC = 0.06       # half-window (frac of band height) for the per-column centroid
 CENTROID_GATE = 0.20            # keep columns whose centroid support >= this frac of the peak
 INLIER_TOL_FRAC = 0.05          # fit inlier tolerance, as a fraction of band height
+MIN_COVERAGE_FRAC = 0.50        # inliers must span >= this frac of the post-cut time axis
+MIN_FILL_FRAC = 0.50            # >= this frac of spanned columns must carry a front pixel
 
 results = []
 
@@ -84,16 +92,18 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
     band_h = band_frames.shape[1]
 
     # --- Build the space-time kymograph over the band ---
-    # The front carries no brightness/color step (it is a refractive-index boundary),
-    # but it is a thin horizontal line. The vertical second derivative |d^2 I / dy^2|
-    # responds to that line regardless of its polarity (dark or bright hairline) and
-    # ignores smooth region-brightness changes. Averaging across the band width
-    # (the front spans the whole tube) keeps the full-width front and dilutes local
-    # bubbles/glints. Stacking the per-frame profiles gives L[y, t].
+    # The front is the leading unreacted->reacted edge: reacted (dark) above, unreacted
+    # (light) below. Scanning a column top->bottom the brightness STEPS UP at the front,
+    # so the vertical first derivative dI/dy is positive there (cv2.Sobel order-1 reads
+    # positive when the pixels below are brighter). Keeping only the positive part fires
+    # on that light-below/dark-above transition while the uniform dark interior behind
+    # the front and the horizontal bubble banding give ~zero response. Averaging across
+    # the band width (the front spans the whole tube) keeps the full-width edge and
+    # dilutes local bubbles/glints. Stacking the per-frame profiles gives L[y, t].
     L = np.empty((band_h, n_frames), dtype=np.float32)
     for t in range(n_frames):
-        d2y = cv2.Sobel(band_frames[t].astype(np.float32), cv2.CV_32F, 0, 2, ksize=LINE_KSIZE)
-        L[:, t] = np.abs(d2y).mean(axis=1)
+        dy = cv2.Sobel(band_frames[t].astype(np.float32), cv2.CV_32F, 0, 1, ksize=EDGE_KSIZE)
+        L[:, t] = np.clip(dy, 0, None).mean(axis=1)
     L = cv2.GaussianBlur(L, (KYMO_SMOOTH, KYMO_SMOOTH), 0)
     # Remove static horizontal features (tube bottom, meniscus, fixed markings): they
     # are constant in time, so subtracting each row's temporal median cancels them
@@ -101,14 +111,26 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
     # feature on the kymograph.
     L = np.clip(L - np.median(L, axis=1, keepdims=True), 0, None)
 
+    # --- Ignore the first ~1/3 of the time axis ---
+    # That region is test-tube jostling + soldering-iron initiation, not a steady front.
+    # The threshold, the line search, and the fit all use only the retained columns; the
+    # steady diagonal persists well past the cut, so the steady-state speed is unaffected.
+    t_start = int(START_FRACTION * n_frames)
+    n_ret = n_frames - t_start
+
+    # Edge-presence threshold from the RETAINED region only, so the dense early
+    # initiation blobs cannot bias the percentile.
+    edge_thr = float(np.percentile(L[:, t_start:], EDGE_PCTL))
+
     # --- Find the dominant downward diagonal with a wide-range Radon search ---
     # The front speed varies wildly between runs, so we search a WIDE band of downward
     # slopes. For each candidate line y = m*t + b we sum the kymograph response along
-    # the line (normalized by its in-frame length). Summing the whole line lifts a
-    # faint front out of the noise; near-horizontal lines are excluded by the slope
-    # range, so bubble bands / residual static features can never accumulate. The
-    # maximizing (m, b) seeds the per-column centroid trace below.
-    slope = intercept = speed_px_s = r2 = np.nan
+    # the line (normalized by its in-frame length), over the retained columns only.
+    # Summing the whole line lifts a faint front out of the noise; near-horizontal lines
+    # are excluded by the slope range, so bubble bands / residual static features can
+    # never accumulate. The maximizing (m, b) seeds the per-column centroid trace below.
+    slope = intercept = speed_px_s = np.nan
+    coverage_frac = fill_frac = np.nan
     n_inliers = 0
     status = 'FAILED_NO_STABLE_FRONT'
 
@@ -117,7 +139,8 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
     m_min = SLOPE_MIN_TRAVEL_FRAC * band_h / n_frames          # slowest plausible front
     m_max = band_h / max(1.0, MIN_TRANSIT_FRAC * n_frames)     # fastest plausible front
     slopes = np.linspace(m_min, m_max, N_SLOPES)
-    min_support = max(10, int(MIN_SUPPORT_FRAC * n_frames))
+    min_support = max(10, int(MIN_SUPPORT_FRAC * n_ret))
+    half = max(3, int(CENTROID_HALF_FRAC * band_h))
 
     best_score = -1.0
     seed_slope = seed_inter = np.nan
@@ -125,6 +148,7 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
         shifts = np.round(m * t_idx).astype(int)              # row offset of the line per column
         target = b_idx[:, None] + shifts[None, :]            # row index hit at each (b, t)
         valid = (target >= 0) & (target < band_h)
+        valid[:, :t_start] = False                           # retained columns only
         gathered = L[np.clip(target, 0, band_h - 1), t_idx[None, :]]
         gathered[~valid] = 0.0
         cnt = valid.sum(axis=1)
@@ -142,8 +166,7 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
     strength = np.zeros(n_frames)
     if not np.isnan(seed_slope):
         pred_rows = seed_slope * t_idx + seed_inter
-        half = max(3, int(CENTROID_HALF_FRAC * band_h))
-        for t in t_idx:
+        for t in range(t_start, n_frames):
             lo = int(max(0, np.floor(pred_rows[t] - half)))
             hi = int(min(band_h, np.ceil(pred_rows[t] + half) + 1))
             if hi - lo < 3:
@@ -166,11 +189,30 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
         n_inliers = int(inl.sum())
         if n_inliers >= 10:
             res = stats.linregress(xs[inl], ys[inl])
-            if res.slope > 0:
-                slope, r2 = res.slope, res.rvalue ** 2
+            if res.slope > 0:                                # downward front required
+                slope = res.slope
                 intercept = res.intercept                    # band coords, full time axis
                 speed_px_s = abs(slope) * fps
-                status = 'OK' if r2 >= 0.80 else 'FAILED_NO_STABLE_FRONT'
+
+                # --- Accept on GEOMETRY, not R^2 ---
+                # R^2 is meaningless here (the points were selected for lying on a line,
+                # so it is ~1 by construction). Instead require (1) the inliers to span a
+                # large fraction of the post-cut time axis and (2) most of those spanned
+                # columns to actually carry a front pixel (continuity / fill).
+                xin = xs[inl]
+                lo_t, hi_t = int(xin.min()), int(xin.max())
+                span_cols = np.arange(lo_t, hi_t + 1)
+                coverage_frac = len(span_cols) / max(1, n_ret)
+                pred = slope * span_cols + intercept
+                carries = 0
+                for tt, pr in zip(span_cols, pred):
+                    a = int(max(0, np.floor(pr - half)))
+                    bb = int(min(band_h, np.ceil(pr + half) + 1))
+                    if bb > a and L[a:bb, tt].max() >= edge_thr:
+                        carries += 1
+                fill_frac = carries / max(1, len(span_cols))
+                status = ('OK' if coverage_frac >= MIN_COVERAGE_FRAC
+                          and fill_frac >= MIN_FILL_FRAC else 'FAILED_NO_STABLE_FRONT')
 
     if CALIBRATION_MM_PER_PX is not None:
         speed = speed_px_s * CALIBRATION_MM_PER_PX
@@ -181,7 +223,8 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
 
     print(f"  Band rows [{band_top}:{band_bottom}] cols [{band_left}:{band_right}], "
           f"kymograph {L.shape[0]}x{L.shape[1]}, fit inliers: {n_inliers}")
-    print(f"  Status: {status}, Speed: {speed:.3f} {speed_unit}, R²: {r2:.4f}")
+    print(f"  Status: {status}, Speed: {speed:.3f} {speed_unit}, "
+          f"coverage: {coverage_frac:.2f}, fill: {fill_frac:.2f}")
 
     # Per-column centroid trace (gated) and the fitted diagonal, both in full-frame px.
     times = np.arange(n_frames) / fps
@@ -197,10 +240,14 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
     }).to_csv(os.path.join(OUTPUT_DATA_DIR, f'{stem}_position_time.csv'), index=False)
 
     # Position-vs-time plot: gated ridge points + fitted diagonal
+    t_cut_s = t_start / fps
+    fit_label = (f'Fit: {speed:.2f} {speed_unit}, '
+                 f'cov={coverage_frac:.2f}, fill={fill_frac:.2f}')
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.scatter(times, front_raw, s=4, alpha=0.5, label='Front centroid')
     if not np.isnan(slope):
-        ax.plot(times, front_fit, 'r-', label=f'Fit: {speed:.2f} {speed_unit}, R²={r2:.3f}')
+        ax.plot(times, front_fit, 'r-', label=fit_label)
+    ax.axvspan(times[0], t_cut_s, color='gray', alpha=0.15, label='Ignored start')
     ax.axhspan(band_top, band_bottom, color='gray', alpha=0.08, label='Band')
     ax.set_xlabel('Time (s)')
     ax.set_ylabel('Front position (px)')
@@ -218,8 +265,8 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
                extent=[times[0], times[-1], band_bottom, band_top])
     axk.scatter(times, front_raw, s=4, c='tab:blue', alpha=0.5, label='Front centroid')
     if not np.isnan(slope):
-        axk.plot(times, front_fit, 'r-', lw=1.5,
-                 label=f'Fit: {speed:.2f} {speed_unit}, R²={r2:.3f}')
+        axk.plot(times, front_fit, 'r-', lw=1.5, label=fit_label)
+    axk.axvspan(times[0], t_cut_s, color='tab:red', alpha=0.10, label='Ignored start')
     axk.legend()
     axk.set_xlabel('Time (s)')
     axk.set_ylabel('Front position (px)')
@@ -255,7 +302,8 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
         'video': video_path,
         'status': status,
         f'speed_{speed_unit.replace("/", "_per_")}': round(speed, 4) if not np.isnan(speed) else np.nan,
-        'r2': round(r2, 4) if not np.isnan(r2) else np.nan,
+        'coverage': round(coverage_frac, 4) if not np.isnan(coverage_frac) else np.nan,
+        'fill': round(fill_frac, 4) if not np.isnan(fill_frac) else np.nan,
         'direction': 'down',
         **meta,
     })
