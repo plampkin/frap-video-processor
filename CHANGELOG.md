@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.0] - 2026-06-18
+
+### Changed
+- `process_videos.py`: **reinstated the hard-coded middle-50% analysis band** on
+  both axes (`BAND_TOP/BOTTOM/LEFT/RIGHT_FRACTION = 0.25/0.75`). The kymograph is
+  built only over this band, dropping the top jostling / initiation, the
+  bottom-of-tube plateau, and the tube walls / background glints.
+- `process_videos.py`: **replaced the Hough + OLS-on-inlier-pixels diagonal fit**
+  (which let the fitted front fall behind / get lost when part of the diagonal
+  faded or spurious bright clusters appeared) with a **robust per-column trace +
+  Theil-Sen fit**. Each time-column contributes the row of strongest line
+  response (`argmax`), columns whose peak is below `RIDGE_GATE * max` are gated
+  out (front enters at any time), and the diagonal is fit with `scipy.stats.theilslopes`;
+  the fit is then refined with OLS on the robust inliers and required to be
+  downward (`slope > 0`). Removed `RIDGE_PCTL` / `MIN_LINE_FRAC`; added `RIDGE_GATE`.
+- `process_videos.py`: diagnostics now show the band kymograph, the band shaded on
+  the position-time plot, and the middle-50% rectangle on the annotated video.
+
 ## [0.7.0] - 2026-06-18
 
 ### Changed

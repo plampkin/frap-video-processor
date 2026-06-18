@@ -20,15 +20,23 @@ os.makedirs(OUTPUT_DATA_DIR, exist_ok=True)
 # Parameters
 BLUR_KERNEL = 5                 # spatial blur applied to each frame
 CALIBRATION_MM_PER_PX = None    # None -> report px/s; set (e.g. 0.1) to report mm/s
-# The whole frame is analyzed: there is no hard-coded or per-video analysis region.
+# Only the middle 50% of the frame is analyzed (hard-coded), horizontally and
+# vertically. This drops the top jostling / soldering-iron initiation, the
+# bottom-of-tube plateau, and the tube walls / background glints, leaving a clean
+# band the front sweeps through.
+BAND_TOP_FRACTION = 0.25
+BAND_BOTTOM_FRACTION = 0.75
+BAND_LEFT_FRACTION = 0.25
+BAND_RIGHT_FRACTION = 0.75
 # The front is a thin, near-horizontal refractive-index line that sweeps downward.
 # On the space-time kymograph it shows up as one clear diagonal line whose slope is
-# the front speed (rows per frame). We detect that diagonal and fit it directly.
+# the front speed (rows per frame). We trace that diagonal per time-column and fit
+# it with a robust (Theil-Sen) estimator so a few lost/spurious columns can't drag
+# the fit off the line.
 LINE_KSIZE = 3                  # vertical 2nd-derivative kernel (front-line detector)
 KYMO_SMOOTH = 5                 # Gaussian smoothing of the kymograph (odd)
-RIDGE_PCTL = 95                 # keep kymograph pixels above this percentile for Hough
-MIN_LINE_FRAC = 0.30            # min Hough line length, as a fraction of frame count
-INLIER_TOL_FRAC = 0.03          # diagonal-fit inlier tolerance, as a fraction of height
+RIDGE_GATE = 0.30               # keep only columns whose peak >= this * global max
+INLIER_TOL_FRAC = 0.05          # robust-fit inlier tolerance, as a fraction of band height
 
 results = []
 
@@ -58,16 +66,24 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
     frames_gray = np.array(frames_gray)
     n_frames, H, W = frames_gray.shape
 
-    # --- Build the space-time kymograph over the whole frame ---
+    # --- Crop to the middle 50% of the frame (both axes) ---
+    band_top = int(H * BAND_TOP_FRACTION)
+    band_bottom = int(H * BAND_BOTTOM_FRACTION)
+    band_left = int(W * BAND_LEFT_FRACTION)
+    band_right = int(W * BAND_RIGHT_FRACTION)
+    band_frames = frames_gray[:, band_top:band_bottom, band_left:band_right]
+    band_h = band_frames.shape[1]
+
+    # --- Build the space-time kymograph over the band ---
     # The front carries no brightness/color step (it is a refractive-index boundary),
     # but it is a thin horizontal line. The vertical second derivative |d^2 I / dy^2|
     # responds to that line regardless of its polarity (dark or bright hairline) and
-    # ignores smooth region-brightness changes. Averaging across the full frame width
+    # ignores smooth region-brightness changes. Averaging across the band width
     # (the front spans the whole tube) keeps the full-width front and dilutes local
     # bubbles/glints. Stacking the per-frame profiles gives L[y, t].
-    L = np.empty((H, n_frames), dtype=np.float32)
+    L = np.empty((band_h, n_frames), dtype=np.float32)
     for t in range(n_frames):
-        d2y = cv2.Sobel(frames_gray[t].astype(np.float32), cv2.CV_32F, 0, 2, ksize=LINE_KSIZE)
+        d2y = cv2.Sobel(band_frames[t].astype(np.float32), cv2.CV_32F, 0, 2, ksize=LINE_KSIZE)
         L[:, t] = np.abs(d2y).mean(axis=1)
     L = cv2.GaussianBlur(L, (KYMO_SMOOTH, KYMO_SMOOTH), 0)
     # Remove static horizontal features (tube bottom, meniscus, fixed markings): they
@@ -76,48 +92,36 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
     # feature on the kymograph.
     L = np.clip(L - np.median(L, axis=1, keepdims=True), 0, None)
 
-    # --- Detect the diagonal front line and fit it ---
-    # Binarize the brightest ridge pixels, then run a probabilistic Hough transform.
-    # The front is the dominant downward diagonal; any residual static line would be
-    # horizontal and is rejected by the positive-slope (downward-travel) constraint.
-    norm = L / (L.max() + 1e-9)
-    mask = (norm >= np.percentile(norm, RIDGE_PCTL)).astype(np.uint8) * 255
-    lines = cv2.HoughLinesP(
-        mask, rho=1, theta=np.pi / 180,
-        threshold=max(10, int(0.15 * n_frames)),
-        minLineLength=int(MIN_LINE_FRAC * n_frames),
-        maxLineGap=int(0.10 * n_frames) + 1,
-    )
+    # --- Trace the diagonal per time-column and fit it robustly ---
+    # For each frame (column) the front is the row of strongest line response. Columns
+    # before the front enters the band, or where it fades, have a weak peak: gate them
+    # out so they don't contribute spurious points. A robust Theil-Sen fit then ignores
+    # the few remaining outliers that previously dragged the OLS/Hough fit off the line
+    # (the "front fell behind" failure). x = frame index, y = front row within the band.
+    col_peak = np.argmax(L, axis=0).astype(float)
+    col_max = L.max(axis=0)
+    gate = RIDGE_GATE * float(col_max.max())
+    valid = col_max >= gate
 
-    # Pick the longest downward (slope > 0) Hough segment as the diagonal seed.
-    seed = None
-    if lines is not None:
-        for x1, y1, x2, y2 in lines[:, 0, :]:
-            if x2 == x1:
-                continue
-            m = (y2 - y1) / (x2 - x1)
-            if m <= 0:
-                continue
-            length = np.hypot(x2 - x1, y2 - y1)
-            if seed is None or length > seed[0]:
-                seed = (length, m, y1 - m * x1)
+    xs = np.arange(n_frames)[valid]
+    ys = col_peak[valid]
 
     slope = intercept = speed_px_s = r2 = np.nan
     n_inliers = 0
     status = 'FAILED_NO_STABLE_FRONT'
 
-    if seed is not None:
-        _, m0, b0 = seed
-        # Least-squares fit the diagonal to the ridge pixels that support the seed line.
-        ys_px, xs_px = np.nonzero(mask)
-        tol = INLIER_TOL_FRAC * H
-        inl = np.abs(ys_px - (m0 * xs_px + b0)) < tol
+    if len(xs) >= 10:
+        ts_slope, ts_inter, _, _ = stats.theilslopes(ys, xs)
+        tol = INLIER_TOL_FRAC * band_h
+        inl = np.abs(ys - (ts_slope * xs + ts_inter)) < tol
         n_inliers = int(inl.sum())
+        # Refine on the robust inliers and require downward travel (slope > 0).
         if n_inliers >= 10:
-            res = stats.linregress(xs_px[inl], ys_px[inl])  # x = frame index, y = front row
-            slope, intercept, r2 = res.slope, res.intercept, res.rvalue ** 2
-            speed_px_s = abs(slope) * fps
-            status = 'OK' if r2 >= 0.80 else 'FAILED_NO_STABLE_FRONT'
+            res = stats.linregress(xs[inl], ys[inl])
+            if res.slope > 0:
+                slope, intercept, r2 = res.slope, res.intercept, res.rvalue ** 2
+                speed_px_s = abs(slope) * fps
+                status = 'OK' if r2 >= 0.80 else 'FAILED_NO_STABLE_FRONT'
 
     if CALIBRATION_MM_PER_PX is not None:
         speed = speed_px_s * CALIBRATION_MM_PER_PX
@@ -126,13 +130,15 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
         speed = speed_px_s
         speed_unit = 'px/s'
 
-    print(f"  Kymograph {L.shape[0]}x{L.shape[1]}, diagonal inliers: {n_inliers}")
+    print(f"  Band rows [{band_top}:{band_bottom}] cols [{band_left}:{band_right}], "
+          f"kymograph {L.shape[0]}x{L.shape[1]}, fit inliers: {n_inliers}")
     print(f"  Status: {status}, Speed: {speed:.3f} {speed_unit}, R²: {r2:.4f}")
 
-    # Per-column raw ridge (argmax) for reference, and the fitted diagonal.
+    # Per-column gated ridge and the fitted diagonal, both in full-frame px coords.
     times = np.arange(n_frames) / fps
-    front_raw = np.argmax(L, axis=0).astype(float)
-    front_fit = slope * np.arange(n_frames) + intercept if not np.isnan(slope) else np.full(n_frames, np.nan)
+    front_raw = np.where(valid, band_top + col_peak, np.nan)
+    front_fit = (band_top + slope * np.arange(n_frames) + intercept
+                 if not np.isnan(slope) else np.full(n_frames, np.nan))
 
     # Per-video position-time CSV
     pd.DataFrame({
@@ -141,11 +147,12 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
         'front_y_px_fit': front_fit,
     }).to_csv(os.path.join(OUTPUT_DATA_DIR, f'{stem}_position_time.csv'), index=False)
 
-    # Position-vs-time plot: raw ridge points + fitted diagonal
+    # Position-vs-time plot: gated ridge points + fitted diagonal
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.scatter(times, front_raw, s=2, alpha=0.3, label='Ridge (raw argmax)')
+    ax.scatter(times, front_raw, s=2, alpha=0.3, label='Ridge (gated argmax)')
     if not np.isnan(slope):
         ax.plot(times, front_fit, 'r-', label=f'Fit: {speed:.2f} {speed_unit}, R²={r2:.3f}')
+    ax.axhspan(band_top, band_bottom, color='gray', alpha=0.08, label='Band')
     ax.set_xlabel('Time (s)')
     ax.set_ylabel('Front position (px)')
     ax.set_ylim(H, 0)
@@ -155,10 +162,10 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
     fig.savefig(os.path.join(OUTPUT_IMAGE_DIR, f'{stem}_position_time.png'), dpi=150)
     plt.close(fig)
 
-    # Diagnostic: kymograph (x=time, y=frame row) with the fitted diagonal overlaid.
+    # Diagnostic: band kymograph (x=time, y=frame row) with the fitted diagonal overlaid.
     figk, axk = plt.subplots(figsize=(8, 5))
     axk.imshow(L, cmap='magma', aspect='auto', origin='upper',
-               extent=[times[0], times[-1], H, 0])
+               extent=[times[0], times[-1], band_bottom, band_top])
     if not np.isnan(slope):
         axk.plot(times, front_fit, 'c-', lw=1.5,
                  label=f'Fit: {speed:.2f} {speed_unit}, R²={r2:.3f}')
@@ -178,6 +185,8 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
         ret, frame = cap2.read()
         if not ret:
             break
+        # middle-50% analysis band
+        cv2.rectangle(frame, (band_left, band_top), (band_right, band_bottom), (255, 255, 0), 1)
         fy = front_fit[i]
         if not np.isnan(fy) and 0 <= fy < frame_h:
             cv2.line(frame, (0, int(fy)), (frame_w, int(fy)), (0, 0, 255), 2)
