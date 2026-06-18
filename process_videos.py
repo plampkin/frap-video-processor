@@ -47,7 +47,7 @@ KYMO_SMOOTH = 5                 # Gaussian smoothing of the kymograph (odd)
 START_FRACTION = 1.0 / 3.0      # ignore the first ~1/3 (jostling + initiation transient)
 EDGE_PCTL = 80                  # edge-presence threshold percentile (retained region only)
 N_SLOPES = 240                  # number of candidate downward slopes in the Radon search
-SLOPE_MIN_TRAVEL_FRAC = 0.10    # slowest front: covers >= this frac of band over the whole video
+MIN_FRONT_SPEED_PX_S = 0.1      # real speed floor (px/s): drops near-horizontal bubble bands
 MIN_TRANSIT_FRAC = 0.05         # fastest front: can't cross the band in < this frac of frames
 MIN_SUPPORT_FRAC = 0.15         # a candidate line must span >= this frac of retained frames
 EDGE_HALF_FRAC = 0.06           # half-window (frac of band height) for the per-column edge search
@@ -135,7 +135,7 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
 
     t_idx = np.arange(n_frames)
     b_idx = np.arange(band_h)
-    m_min = SLOPE_MIN_TRAVEL_FRAC * band_h / n_frames          # slowest plausible front
+    m_min = MIN_FRONT_SPEED_PX_S / fps                         # speed floor (rows/frame)
     m_max = band_h / max(1.0, MIN_TRANSIT_FRAC * n_frames)     # fastest plausible front
     slopes = np.linspace(m_min, m_max, N_SLOPES)
     min_support = max(10, int(MIN_SUPPORT_FRAC * n_ret))
@@ -211,8 +211,13 @@ for video_path in sorted(glob.glob(os.path.join(INPUT_DIR, '*.mov'))):
                     if bb > a and L[a:bb, tt].max() >= edge_thr:
                         carries += 1
                 fill_frac = carries / max(1, len(span_cols))
+                # A near-horizontal bubble band is continuous and spans the time axis,
+                # so coverage/fill cannot reject it -- only a real speed floor can. Require
+                # the fitted speed to clear MIN_FRONT_SPEED_PX_S as well.
                 status = ('OK' if coverage_frac >= MIN_COVERAGE_FRAC
-                          and fill_frac >= MIN_FILL_FRAC else 'FAILED_NO_STABLE_FRONT')
+                          and fill_frac >= MIN_FILL_FRAC
+                          and speed_px_s >= MIN_FRONT_SPEED_PX_S
+                          else 'FAILED_NO_STABLE_FRONT')
 
     if CALIBRATION_MM_PER_PX is not None:
         speed = speed_px_s * CALIBRATION_MM_PER_PX
